@@ -5,6 +5,7 @@ mod proc;
 use config::Config;
 use ipc::IpcCommand;
 use proc::ProcManager;
+use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
 const USAGE: &str = "\
@@ -17,10 +18,25 @@ COMMANDS:
     start     Start all processes (default)
     stop      Stop running instance
     status    Show process states
+    logs      Show log paths or search logs
 
 OPTIONS:
     -c, --config <PATH>  Config file path (default: ads.toml)
     -h, --help           Show this help
+";
+
+const LOGS_USAGE: &str = "\
+ads logs — Show log paths or search logs
+
+USAGE:
+    ads logs [NAME] [OPTIONS]
+
+ARGS:
+    <NAME>               Show log file path for a specific process
+
+OPTIONS:
+    -s, --search <PATTERN>  Search across all log files
+    -h, --help              Show this help
 ";
 
 fn main() {
@@ -37,21 +53,25 @@ fn main() {
         .unwrap_or_default()
         .unwrap_or_else(|| PathBuf::from("ads.toml"));
 
-    let remaining = args.finish();
-    if !remaining.is_empty() {
-        eprintln!("Unknown arguments: {remaining:?}");
-        eprint!("{USAGE}");
-        std::process::exit(1);
-    }
-
     match subcommand.as_deref() {
-        None | Some("start") => cmd_start(config_path),
-        Some("stop") => cmd_stop(config_path),
-        Some("status") => cmd_status(config_path),
-        Some(other) => {
-            eprintln!("Unknown command: {other}");
-            eprint!("{USAGE}");
-            std::process::exit(1);
+        Some("logs") => cmd_logs(config_path, args),
+        _ => {
+            let remaining = args.finish();
+            if !remaining.is_empty() {
+                eprintln!("Unknown arguments: {remaining:?}");
+                eprint!("{USAGE}");
+                std::process::exit(1);
+            }
+            match subcommand.as_deref() {
+                None | Some("start") => cmd_start(config_path),
+                Some("stop") => cmd_stop(config_path),
+                Some("status") => cmd_status(config_path),
+                Some(other) => {
+                    eprintln!("Unknown command: {other}");
+                    eprint!("{USAGE}");
+                    std::process::exit(1);
+                }
+            }
         }
     }
 }
@@ -150,4 +170,84 @@ fn cmd_status(config_path: PathBuf) {
             }
         }
     });
+}
+
+fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
+    if args.contains(["-h", "--help"]) {
+        print!("{LOGS_USAGE}");
+        return;
+    }
+
+    let search_pattern: Option<String> = args
+        .opt_value_from_str(["-s", "--search"])
+        .unwrap_or_default();
+
+    let proc_name: Option<String> = args.opt_free_from_str().unwrap_or_default();
+
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        eprintln!("Unknown arguments: {remaining:?}");
+        eprint!("{LOGS_USAGE}");
+        std::process::exit(1);
+    }
+
+    let log_dir = ipc::log_dir(&config_path);
+
+    if let Some(pattern) = search_pattern {
+        // Search across all log files
+        if !log_dir.is_dir() {
+            eprintln!("No log directory found (is `ads start` running?)");
+            std::process::exit(1);
+        }
+        let mut entries: Vec<_> = std::fs::read_dir(&log_dir)
+            .unwrap_or_else(|e| {
+                eprintln!("Failed to read log directory: {e}");
+                std::process::exit(1);
+            })
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+            .collect();
+        entries.sort_by_key(|e| e.file_name());
+
+        let mut found = false;
+        for entry in entries {
+            let path = entry.path();
+            let name = path.file_stem().unwrap_or_default().to_string_lossy();
+            let file = match std::fs::File::open(&path) {
+                Ok(f) => f,
+                Err(_) => continue,
+            };
+            for (line_num, line) in BufReader::new(file).lines().enumerate() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => continue,
+                };
+                if line.contains(&pattern) {
+                    println!("{name}:{}: {line}", line_num + 1);
+                    found = true;
+                }
+            }
+        }
+        if !found {
+            eprintln!("No matches found for '{pattern}'");
+            std::process::exit(1);
+        }
+    } else if let Some(name) = proc_name {
+        // Print log file path for a specific process
+        let log_path = log_dir.join(format!("{name}.log"));
+        if log_path.is_file() {
+            println!("{}", log_path.display());
+        } else {
+            eprintln!("No log file found for process '{name}'");
+            std::process::exit(1);
+        }
+    } else {
+        // Print log directory path
+        if log_dir.is_dir() {
+            println!("{}", log_dir.display());
+        } else {
+            eprintln!("No log directory found (is `ads start` running?)");
+            std::process::exit(1);
+        }
+    }
 }

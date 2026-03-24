@@ -19,9 +19,9 @@ Capture managed process stdout and stderr to log files, and provide commands to 
 - [x] Continue forwarding to terminal as before (dual output)
 
 ### 2. CLI commands for log access
-- [ ] `ads logs` — print log directory path (so Claude/user can find logs)
-- [ ] `ads logs <name>` — print log file path for a specific process
-- [ ] `ads logs --search <pattern>` / `-s <pattern>` — search across all log files, print matching lines with process name and line number
+- [x] `ads logs` — print log directory path (so Claude/user can find logs)
+- [x] `ads logs <name>` — print log file path for a specific process
+- [x] `ads logs --search <pattern>` / `-s <pattern>` — search across all log files, print matching lines with process name and line number
 
 ### 3. IPC support for log queries
 - [ ] Add `LOGS` IPC command — returns log directory path
