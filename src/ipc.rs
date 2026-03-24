@@ -163,6 +163,42 @@ async fn handle_client_inner(
                 }
             }
         }
+        "TRACES" => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(IpcCommand::Traces { reply: reply_tx })
+                .await?;
+            match reply_rx.await {
+                Ok(response) => {
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(_) => {
+                    writer
+                        .write_all(b"error: server shutting down\n")
+                        .await?;
+                }
+            }
+        }
+        other if other.starts_with("TRACE ") => {
+            let trace_id = other[6..].to_string();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(IpcCommand::Trace {
+                    trace_id,
+                    reply: reply_tx,
+                })
+                .await?;
+            match reply_rx.await {
+                Ok(response) => {
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(_) => {
+                    writer
+                        .write_all(b"error: server shutting down\n")
+                        .await?;
+                }
+            }
+        }
         other => {
             writer
                 .write_all(format!("unknown command: {other}\n").as_bytes())

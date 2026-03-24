@@ -31,7 +31,7 @@ Receive OTLP traces from managed processes, store in memory, expose via IPC and 
   - Inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` into process env
   - Add `TRACES` and `TRACE <id>` IPC command variants
   - Print OTel endpoint on startup
-- [ ] 4. Add IPC commands in `src/ipc.rs`
+- [x] 4. Add IPC commands in `src/ipc.rs`
   - `TRACES` → list recent traces (id, service, root span name, span count, duration)
   - `TRACE <id>` → full span details for a trace
 - [ ] 5. Add MCP tools in `src/channel.rs`
