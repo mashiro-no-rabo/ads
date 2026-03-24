@@ -4,83 +4,68 @@ mod ipc;
 mod otel;
 mod proc;
 
+use clap::{Parser, Subcommand};
 use config::Config;
 use ipc::IpcCommand;
 use proc::ProcManager;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
 
-const USAGE: &str = "\
-ads — agent-dev-stack
+/// ads — agent-dev-stack
+///
+/// Manages a local dev stack for Claude Code sessions: spawns processes,
+/// captures logs, collects OpenTelemetry traces, and exposes tools via MCP.
+#[derive(Parser)]
+#[command(name = "ads", version)]
+struct Cli {
+    /// Config file path
+    #[arg(short, long, default_value = "ads.toml", global = true)]
+    config: PathBuf,
 
-USAGE:
-    ads <COMMAND> [OPTIONS]
+    #[command(subcommand)]
+    command: Option<Command>,
+}
 
-COMMANDS:
-    start     Start all processes (default)
-    stop      Stop running instance
-    status    Show process states
-    logs      Show log paths or search logs
-    traces    List recent traces
-    trace     Show trace details by ID
-    channel   Start MCP server on stdio
+#[derive(Subcommand)]
+enum Command {
+    /// Start all processes (default when no command given)
+    Start,
+    /// Stop a running ads instance
+    Stop,
+    /// Show process states
+    Status,
+    /// Show log paths or search logs
+    Logs {
+        /// Show log file path for a specific process
+        name: Option<String>,
 
-OPTIONS:
-    -c, --config <PATH>  Config file path (default: ads.toml)
-    -h, --help           Show this help
-";
-
-const LOGS_USAGE: &str = "\
-ads logs — Show log paths or search logs
-
-USAGE:
-    ads logs [NAME] [OPTIONS]
-
-ARGS:
-    <NAME>               Show log file path for a specific process
-
-OPTIONS:
-    -s, --search <PATTERN>  Search across all log files
-    -h, --help              Show this help
-";
+        /// Search across all log files for a pattern
+        #[arg(short, long)]
+        search: Option<String>,
+    },
+    /// List recent OpenTelemetry traces
+    Traces,
+    /// Show trace details by ID
+    Trace {
+        /// The trace ID to look up
+        trace_id: String,
+    },
+    /// Start MCP server on stdio for Claude Code integration
+    Channel,
+}
 
 fn main() {
-    let mut args = pico_args::Arguments::from_env();
+    let cli = Cli::parse();
+    let config_path = cli.config;
 
-    if args.contains(["-h", "--help"]) {
-        print!("{USAGE}");
-        return;
-    }
-
-    let subcommand = args.subcommand().unwrap_or_default();
-    let config_path: PathBuf = args
-        .opt_value_from_str(["-c", "--config"])
-        .unwrap_or_default()
-        .unwrap_or_else(|| PathBuf::from("ads.toml"));
-
-    match subcommand.as_deref() {
-        Some("logs") => cmd_logs(config_path, args),
-        Some("trace") => cmd_trace(config_path, args),
-        Some("channel") => cmd_channel(config_path, args),
-        _ => {
-            let remaining = args.finish();
-            if !remaining.is_empty() {
-                eprintln!("Unknown arguments: {remaining:?}");
-                eprint!("{USAGE}");
-                std::process::exit(1);
-            }
-            match subcommand.as_deref() {
-                None | Some("start") => cmd_start(config_path),
-                Some("stop") => cmd_stop(config_path),
-                Some("status") => cmd_status(config_path),
-                Some("traces") => cmd_traces(config_path),
-                Some(other) => {
-                    eprintln!("Unknown command: {other}");
-                    eprint!("{USAGE}");
-                    std::process::exit(1);
-                }
-            }
-        }
+    match cli.command {
+        None | Some(Command::Start) => cmd_start(config_path),
+        Some(Command::Stop) => cmd_stop(config_path),
+        Some(Command::Status) => cmd_status(config_path),
+        Some(Command::Traces) => cmd_traces(config_path),
+        Some(Command::Trace { trace_id }) => cmd_trace(config_path, &trace_id),
+        Some(Command::Logs { name, search }) => cmd_logs(config_path, name, search),
+        Some(Command::Channel) => cmd_channel(config_path),
     }
 }
 
@@ -253,25 +238,7 @@ fn cmd_traces(config_path: PathBuf) {
     });
 }
 
-fn cmd_trace(config_path: PathBuf, mut args: pico_args::Arguments) {
-    let trace_id: Option<String> = args.opt_free_from_str().unwrap_or_default();
-
-    let remaining = args.finish();
-    if !remaining.is_empty() {
-        eprintln!("Unknown arguments: {remaining:?}");
-        eprintln!("Usage: ads trace <TRACE_ID>");
-        std::process::exit(1);
-    }
-
-    let trace_id = match trace_id {
-        Some(id) => id,
-        None => {
-            eprintln!("Missing trace ID");
-            eprintln!("Usage: ads trace <TRACE_ID>");
-            std::process::exit(1);
-        }
-    };
-
+fn cmd_trace(config_path: PathBuf, trace_id: &str) {
     let sock_path = ipc::socket_path(&config_path);
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
@@ -285,28 +252,10 @@ fn cmd_trace(config_path: PathBuf, mut args: pico_args::Arguments) {
     });
 }
 
-fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
-    if args.contains(["-h", "--help"]) {
-        print!("{LOGS_USAGE}");
-        return;
-    }
-
-    let search_pattern: Option<String> = args
-        .opt_value_from_str(["-s", "--search"])
-        .unwrap_or_default();
-
-    let proc_name: Option<String> = args.opt_free_from_str().unwrap_or_default();
-
-    let remaining = args.finish();
-    if !remaining.is_empty() {
-        eprintln!("Unknown arguments: {remaining:?}");
-        eprint!("{LOGS_USAGE}");
-        std::process::exit(1);
-    }
-
+fn cmd_logs(config_path: PathBuf, name: Option<String>, search: Option<String>) {
     let log_dir = ipc::log_dir(&config_path);
 
-    if let Some(pattern) = search_pattern {
+    if let Some(pattern) = search {
         if !log_dir.is_dir() {
             eprintln!("No log directory found (is `ads start` running?)");
             std::process::exit(1);
@@ -317,7 +266,7 @@ fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
             std::process::exit(1);
         }
         print!("{result}");
-    } else if let Some(name) = proc_name {
+    } else if let Some(name) = name {
         // Print log file path for a specific process
         let log_path = log_dir.join(format!("{name}.log"));
         if log_path.is_file() {
@@ -337,13 +286,7 @@ fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
     }
 }
 
-fn cmd_channel(config_path: PathBuf, args: pico_args::Arguments) {
-    let remaining = args.finish();
-    if !remaining.is_empty() {
-        eprintln!("Unknown arguments: {remaining:?}");
-        std::process::exit(1);
-    }
-
+fn cmd_channel(config_path: PathBuf) {
     let sock_path = ipc::socket_path(&config_path);
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
