@@ -53,9 +53,9 @@ Each proc has:
 - [x] `ads start` — read config, allocate ports, spawn all processes, print port assignments
 - [x] `ads start --config <path>` / `-c <path>` flag for custom config file
 - [x] `ads --help` / `-h` for usage info
-- [ ] `ads stop` — connect to running instance, send shutdown signal (needs IPC — unix socket)
-- [ ] `ads status` — show process states (needs IPC — unix socket)
+- [x] `ads stop` — connect to running instance, send shutdown signal via unix socket IPC
+- [x] `ads status` — show process states via unix socket IPC
 
-## Current Step
+## Done
 
-**Step 3 partially complete.** `start` subcommand works with `pico-args`. `stop` and `status` are stubbed — they need a unix socket IPC mechanism (running instance must listen for commands). This is a separate concern that should be its own step.
+All steps complete. The IPC mechanism uses a unix socket (path derived from config file hash in temp dir). The `start` command runs an IPC server alongside the process manager, handling `STATUS` and `STOP` commands. Client commands connect, send a text command, and read the response.

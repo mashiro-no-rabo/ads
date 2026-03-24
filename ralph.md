@@ -6,4 +6,4 @@ Otherwise, look through all todos/ pick the most important thing to do, analyze 
 
 IMPORTANT: update plan.md with progress, remove the file if all work is done, then update feature document in feats/
 
-ALWAYS use `jj claude-commit [msg]` to commit the work. DO NOT use any other jj nor git commands.
+ALWAYS use `jj claude-commit [msg]` to commit the work then use `jj up` to push the changes. DO NOT use any other jj nor git commands.

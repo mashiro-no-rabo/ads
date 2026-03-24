@@ -1,7 +1,9 @@
 mod config;
+mod ipc;
 mod proc;
 
 use config::Config;
+use ipc::IpcCommand;
 use proc::ProcManager;
 use std::path::PathBuf;
 
@@ -44,8 +46,8 @@ fn main() {
 
     match subcommand.as_deref() {
         None | Some("start") => cmd_start(config_path),
-        Some("stop") => cmd_stop(),
-        Some("status") => cmd_status(),
+        Some("stop") => cmd_stop(config_path),
+        Some("status") => cmd_status(config_path),
         Some(other) => {
             eprintln!("Unknown command: {other}");
             eprint!("{USAGE}");
@@ -62,6 +64,8 @@ fn cmd_start(config_path: PathBuf) {
             std::process::exit(1);
         }
     };
+
+    let sock_path = ipc::socket_path(&config_path);
 
     if !config.ports.is_empty() {
         println!("Allocated ports:");
@@ -82,21 +86,66 @@ fn cmd_start(config_path: PathBuf) {
             }
         };
 
-        if let Err(e) = tokio::signal::ctrl_c().await {
-            eprintln!("Failed to listen for ctrl-c: {e}");
+        let (mut ipc_rx, ipc_server) = match ipc::start_server(&sock_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to start IPC server: {e}");
+                std::process::exit(1);
+            }
+        };
+
+        tokio::spawn(ipc_server.run());
+
+        loop {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => {
+                    println!("\nShutting down...");
+                    break;
+                }
+                cmd = ipc_rx.recv() => {
+                    match cmd {
+                        Some(IpcCommand::Status { reply }) => {
+                            let _ = reply.send(manager.status());
+                        }
+                        Some(IpcCommand::Stop) => {
+                            println!("Received stop command");
+                            break;
+                        }
+                        None => break,
+                    }
+                }
+            }
         }
 
-        println!("\nShutting down...");
         manager.shutdown().await;
+        let _ = std::fs::remove_file(&sock_path);
     });
 }
 
-fn cmd_stop() {
-    eprintln!("ads stop: not yet implemented (requires IPC)");
-    std::process::exit(1);
+fn cmd_stop(config_path: PathBuf) {
+    let sock_path = ipc::socket_path(&config_path);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        match ipc::send_command(&sock_path, "STOP").await {
+            Ok(response) => print!("{response}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
 }
 
-fn cmd_status() {
-    eprintln!("ads status: not yet implemented (requires IPC)");
-    std::process::exit(1);
+fn cmd_status(config_path: PathBuf) {
+    let sock_path = ipc::socket_path(&config_path);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        match ipc::send_command(&sock_path, "STATUS").await {
+            Ok(response) => print!("{response}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
 }
