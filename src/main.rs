@@ -1,6 +1,7 @@
 mod channel;
 mod config;
 mod ipc;
+mod otel;
 mod proc;
 
 use config::Config;
