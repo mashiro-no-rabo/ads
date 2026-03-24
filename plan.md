@@ -26,7 +26,7 @@ Receive OTLP traces from managed processes, store in memory, expose via IPC and 
   - axum router: `POST /v1/traces` decodes `ExportTraceServiceRequest`, stores spans
   - `start_otel_server()` → binds ephemeral port, returns (port, join handle)
   - Query methods: `list_traces()`, `get_trace(id)`
-- [ ] 3. Wire into `cmd_start` in main.rs
+- [x] 3. Wire into `cmd_start` in main.rs
   - Start OTel server before spawning processes
   - Inject `OTEL_EXPORTER_OTLP_ENDPOINT` + `OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf` into process env
   - Add `TRACES` and `TRACE <id>` IPC command variants

@@ -104,7 +104,16 @@ fn cmd_start(config_path: PathBuf) {
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
-        let mut manager = match ProcManager::spawn_all(&config.procs, &log_dir) {
+        let (otel_port, trace_store, _otel_handle) = match otel::start_otel_server().await {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to start OTel server: {e}");
+                std::process::exit(1);
+            }
+        };
+        println!("OTel endpoint: http://127.0.0.1:{otel_port}");
+
+        let mut manager = match ProcManager::spawn_all(&config.procs, &log_dir, Some(otel_port)) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("Error: {e}");
@@ -143,6 +152,49 @@ fn cmd_start(config_path: PathBuf) {
                         Some(IpcCommand::Search { pattern, reply }) => {
                             let result = search_logs(&log_dir, &pattern);
                             let _ = reply.send(result);
+                        }
+                        Some(IpcCommand::Traces { reply }) => {
+                            let store = trace_store.lock().unwrap();
+                            let traces = store.list_traces();
+                            let mut output = String::new();
+                            for t in &traces {
+                                output.push_str(&format!(
+                                    "{} {} {} ({} spans, {:.1}ms)\n",
+                                    t.trace_id, t.service_name, t.root_span_name,
+                                    t.span_count, t.duration_ms,
+                                ));
+                            }
+                            if output.is_empty() {
+                                output.push_str("no traces collected\n");
+                            }
+                            let _ = reply.send(output);
+                        }
+                        Some(IpcCommand::Trace { trace_id, reply }) => {
+                            let store = trace_store.lock().unwrap();
+                            let output = match store.get_trace(&trace_id) {
+                                Some(t) => {
+                                    let mut out = format!(
+                                        "trace: {}\nservice: {}\nroot: {}\nspans: {}\n\n",
+                                        t.trace_id, t.service_name, t.root_span_name, t.spans.len(),
+                                    );
+                                    for s in &t.spans {
+                                        let dur_ms = s.end_time_unix_nano
+                                            .saturating_sub(s.start_time_unix_nano)
+                                            as f64 / 1_000_000.0;
+                                        out.push_str(&format!(
+                                            "  {} {} {:.1}ms status={} parent={}\n",
+                                            s.span_id, s.name, dur_ms, s.status_code,
+                                            if s.parent_span_id.is_empty() { "-" } else { &s.parent_span_id },
+                                        ));
+                                        for (k, v) in &s.attributes {
+                                            out.push_str(&format!("    {k}={v}\n"));
+                                        }
+                                    }
+                                    out
+                                }
+                                None => format!("trace not found: {trace_id}\n"),
+                            };
+                            let _ = reply.send(output);
                         }
                         None => break,
                     }

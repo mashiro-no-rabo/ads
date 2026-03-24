@@ -19,6 +19,13 @@ pub enum IpcCommand {
         pattern: String,
         reply: oneshot::Sender<String>,
     },
+    Traces {
+        reply: oneshot::Sender<String>,
+    },
+    Trace {
+        trace_id: String,
+        reply: oneshot::Sender<String>,
+    },
 }
 
 /// Hash the canonical config path for deterministic derived paths.

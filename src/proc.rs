@@ -19,6 +19,7 @@ impl ProcManager {
     pub fn spawn_all(
         procs: &HashMap<String, ProcConfig>,
         log_dir: &Path,
+        otel_port: Option<u16>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
         std::fs::create_dir_all(log_dir)?;
         let mut children = HashMap::new();
@@ -45,6 +46,13 @@ impl ProcManager {
                 for (k, v) in env {
                     cmd.env(k, v);
                 }
+            }
+            if let Some(port) = otel_port {
+                cmd.env(
+                    "OTEL_EXPORTER_OTLP_ENDPOINT",
+                    format!("http://127.0.0.1:{port}"),
+                );
+                cmd.env("OTEL_EXPORTER_OTLP_PROTOCOL", "http/protobuf");
             }
 
             cmd.stdout(Stdio::piped());
