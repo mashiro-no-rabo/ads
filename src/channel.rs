@@ -28,6 +28,12 @@ pub struct SearchParams {
     pub pattern: String,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct TraceParams {
+    /// The trace ID to look up
+    pub trace_id: String,
+}
+
 #[rmcp::tool_router]
 impl AdsChannel {
     #[tool(description = "Get the status of all managed processes")]
@@ -54,6 +60,28 @@ impl AdsChannel {
         let cmd = format!("SEARCH {}", params.pattern);
         match ipc::send_command(&self.socket_path, &cmd).await {
             Ok(r) if r.is_empty() => "No matches found".to_string(),
+            Ok(r) => r,
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "List recent traces collected from managed processes")]
+    async fn ads_traces(&self) -> String {
+        match ipc::send_command(&self.socket_path, "TRACES").await {
+            Ok(r) if r.is_empty() => "No traces collected".to_string(),
+            Ok(r) => r,
+            Err(e) => format!("Error: {e}"),
+        }
+    }
+
+    #[tool(description = "Get full span details for a specific trace by ID")]
+    async fn ads_trace(
+        &self,
+        Parameters(params): Parameters<TraceParams>,
+    ) -> String {
+        let cmd = format!("TRACE {}", params.trace_id);
+        match ipc::send_command(&self.socket_path, &cmd).await {
+            Ok(r) if r.is_empty() => "Trace not found".to_string(),
             Ok(r) => r,
             Err(e) => format!("Error: {e}"),
         }
