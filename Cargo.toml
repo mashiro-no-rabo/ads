@@ -5,3 +5,8 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+command-group = { version = "5.0.1", features = ["with-tokio"] }
+minijinja = "2.18.0"
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.50.0", features = ["full"] }
+toml = "1.1.0"
