@@ -43,17 +43,19 @@ Each proc has:
 - [x] Allocate ports (bind to :0, get assigned port, close) and render templates
 
 ### 2. Process spawning and lifecycle
-- [ ] Spawn each process using `command-group` (process group)
-- [ ] Capture stdout/stderr via piped handles (store for future log streaming)
-- [ ] Track process state: Starting, Running(pid), Exited(code), Failed(error)
-- [ ] Graceful shutdown: SIGTERM to process group, wait, then SIGKILL after timeout
+- [x] Spawn each process using `command-group` (process group) with `kill_on_drop(true)`
+- [x] Capture stdout/stderr via piped handles, forward with `[name]` prefix
+- [x] Track process state via `try_wait()`: `ProcStatus::Running(pid) | Exited(code) | Failed(err)`
+- [x] Graceful shutdown: SIGTERM to process group, wait 5s, then SIGKILL stragglers
 
 ### 3. CLI interface
-- [ ] `ads start` — read config, allocate ports, spawn all processes, print port assignments
-- [ ] `ads stop` — connect to running instance, send shutdown signal
-- [ ] `ads status` — show process states
-- [ ] Use `pico-args` for CLI parsing (per project rules)
+- [x] Use `pico-args` for CLI parsing (per project rules)
+- [x] `ads start` — read config, allocate ports, spawn all processes, print port assignments
+- [x] `ads start --config <path>` / `-c <path>` flag for custom config file
+- [x] `ads --help` / `-h` for usage info
+- [ ] `ads stop` — connect to running instance, send shutdown signal (needs IPC — unix socket)
+- [ ] `ads status` — show process states (needs IPC — unix socket)
 
 ## Current Step
 
-**Step 1 complete.** Next: Step 2 — Process spawning and lifecycle.
+**Step 3 partially complete.** `start` subcommand works with `pico-args`. `stop` and `status` are stubbed — they need a unix socket IPC mechanism (running instance must listen for commands). This is a separate concern that should be its own step.
