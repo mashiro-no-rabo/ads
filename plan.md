@@ -13,10 +13,10 @@ Capture managed process stdout and stderr to log files, and provide commands to 
 ## Steps
 
 ### 1. Log file setup and writing
-- [ ] Create log directory alongside socket path derivation (reuse config hash)
-- [ ] In `ProcManager::spawn_all`, open a log file per process
-- [ ] Modify stdout/stderr forwarding tasks to write each line to the log file with timestamp and stream tag
-- [ ] Continue forwarding to terminal as before (dual output)
+- [x] Create log directory alongside socket path derivation (reuse config hash)
+- [x] In `ProcManager::spawn_all`, open a log file per process
+- [x] Modify stdout/stderr forwarding tasks to write each line to the log file with timestamp and stream tag
+- [x] Continue forwarding to terminal as before (dual output)
 
 ### 2. CLI commands for log access
 - [ ] `ads logs` — print log directory path (so Claude/user can find logs)

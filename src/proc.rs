@@ -1,8 +1,13 @@
+use chrono::Utc;
 use command_group::{AsyncCommandGroup, AsyncGroupChild, Signal, UnixChildExt};
 use std::collections::HashMap;
+use std::path::Path;
 use std::process::Stdio;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use std::sync::Arc;
+use tokio::fs::File;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 
 use crate::config::ProcConfig;
 
@@ -13,7 +18,9 @@ pub struct ProcManager {
 impl ProcManager {
     pub fn spawn_all(
         procs: &HashMap<String, ProcConfig>,
+        log_dir: &Path,
     ) -> Result<Self, Box<dyn std::error::Error>> {
+        std::fs::create_dir_all(log_dir)?;
         let mut children = HashMap::new();
 
         for (name, proc_config) in procs {
@@ -49,22 +56,38 @@ impl ProcManager {
                 .spawn()
                 .map_err(|e| format!("failed to spawn '{name}': {e}"))?;
 
-            // Take stdout/stderr and spawn forwarding tasks
+            // Open log file for this process (interleaves stdout and stderr)
+            let log_path = log_dir.join(format!("{name}.log"));
+            let log_file = std::fs::File::create(&log_path)
+                .map_err(|e| format!("failed to create log file '{}': {e}", log_path.display()))?;
+            let log_file = Arc::new(Mutex::new(File::from_std(log_file)));
+
+            // Take stdout/stderr and spawn forwarding tasks (dual: terminal + log)
             if let Some(stdout) = child.inner().stdout.take() {
                 let tag = name.clone();
+                let log = Arc::clone(&log_file);
                 tokio::spawn(async move {
                     let mut lines = BufReader::new(stdout).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         println!("[{tag}] {line}");
+                        let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                        let mut f = log.lock().await;
+                        let _ = f.write_all(format!("{ts} OUT {line}\n").as_bytes()).await;
+                        let _ = f.flush().await;
                     }
                 });
             }
             if let Some(stderr) = child.inner().stderr.take() {
                 let tag = name.clone();
+                let log = Arc::clone(&log_file);
                 tokio::spawn(async move {
                     let mut lines = BufReader::new(stderr).lines();
                     while let Ok(Some(line)) = lines.next_line().await {
                         eprintln!("[{tag}] {line}");
+                        let ts = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+                        let mut f = log.lock().await;
+                        let _ = f.write_all(format!("{ts} ERR {line}\n").as_bytes()).await;
+                        let _ = f.flush().await;
                     }
                 });
             }

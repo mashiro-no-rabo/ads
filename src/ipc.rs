@@ -14,15 +14,28 @@ pub enum IpcCommand {
     Stop,
 }
 
-/// Derive a deterministic socket path from the config file's canonical path.
-pub fn socket_path(config_path: &Path) -> PathBuf {
+/// Hash the canonical config path for deterministic derived paths.
+fn config_hash(config_path: &Path) -> u64 {
     let canonical = config_path
         .canonicalize()
         .unwrap_or_else(|_| config_path.to_path_buf());
     let mut hasher = std::hash::DefaultHasher::new();
     canonical.hash(&mut hasher);
-    let hash = hasher.finish();
+    hasher.finish()
+}
+
+/// Derive a deterministic socket path from the config file's canonical path.
+pub fn socket_path(config_path: &Path) -> PathBuf {
+    let hash = config_hash(config_path);
     std::env::temp_dir().join(format!("ads-{hash:x}.sock"))
+}
+
+/// Derive the log directory from the config file's canonical path.
+pub fn log_dir(config_path: &Path) -> PathBuf {
+    let hash = config_hash(config_path);
+    std::env::temp_dir()
+        .join(format!("ads-{hash:x}"))
+        .join("logs")
 }
 
 pub struct IpcServer {

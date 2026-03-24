@@ -66,6 +66,7 @@ fn cmd_start(config_path: PathBuf) {
     };
 
     let sock_path = ipc::socket_path(&config_path);
+    let log_dir = ipc::log_dir(&config_path);
 
     if !config.ports.is_empty() {
         println!("Allocated ports:");
@@ -75,10 +76,11 @@ fn cmd_start(config_path: PathBuf) {
     }
 
     println!("Starting {} proc(s)...", config.procs.len());
+    println!("Logs: {}", log_dir.display());
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
-        let mut manager = match ProcManager::spawn_all(&config.procs) {
+        let mut manager = match ProcManager::spawn_all(&config.procs, &log_dir) {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("Error: {e}");
