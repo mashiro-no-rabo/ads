@@ -133,6 +133,13 @@ fn cmd_start(config_path: PathBuf) {
                             println!("Received stop command");
                             break;
                         }
+                        Some(IpcCommand::Logs { reply }) => {
+                            let _ = reply.send(format!("{}\n", log_dir.display()));
+                        }
+                        Some(IpcCommand::Search { pattern, reply }) => {
+                            let result = search_logs(&log_dir, &pattern);
+                            let _ = reply.send(result);
+                        }
                         None => break,
                     }
                 }
@@ -194,44 +201,16 @@ fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
     let log_dir = ipc::log_dir(&config_path);
 
     if let Some(pattern) = search_pattern {
-        // Search across all log files
         if !log_dir.is_dir() {
             eprintln!("No log directory found (is `ads start` running?)");
             std::process::exit(1);
         }
-        let mut entries: Vec<_> = std::fs::read_dir(&log_dir)
-            .unwrap_or_else(|e| {
-                eprintln!("Failed to read log directory: {e}");
-                std::process::exit(1);
-            })
-            .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
-            .collect();
-        entries.sort_by_key(|e| e.file_name());
-
-        let mut found = false;
-        for entry in entries {
-            let path = entry.path();
-            let name = path.file_stem().unwrap_or_default().to_string_lossy();
-            let file = match std::fs::File::open(&path) {
-                Ok(f) => f,
-                Err(_) => continue,
-            };
-            for (line_num, line) in BufReader::new(file).lines().enumerate() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => continue,
-                };
-                if line.contains(&pattern) {
-                    println!("{name}:{}: {line}", line_num + 1);
-                    found = true;
-                }
-            }
-        }
-        if !found {
+        let result = search_logs(&log_dir, &pattern);
+        if result.is_empty() {
             eprintln!("No matches found for '{pattern}'");
             std::process::exit(1);
         }
+        print!("{result}");
     } else if let Some(name) = proc_name {
         // Print log file path for a specific process
         let log_path = log_dir.join(format!("{name}.log"));
@@ -250,4 +229,37 @@ fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
             std::process::exit(1);
         }
     }
+}
+
+/// Search across all log files in a directory for lines containing `pattern`.
+/// Returns matching lines formatted as `{proc}:{line_number}: {content}`.
+fn search_logs(log_dir: &std::path::Path, pattern: &str) -> String {
+    let mut entries: Vec<_> = match std::fs::read_dir(log_dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "log"))
+            .collect(),
+        Err(_) => return String::new(),
+    };
+    entries.sort_by_key(|e| e.file_name());
+
+    let mut output = String::new();
+    for entry in entries {
+        let path = entry.path();
+        let name = path.file_stem().unwrap_or_default().to_string_lossy();
+        let file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(_) => continue,
+        };
+        for (line_num, line) in BufReader::new(file).lines().enumerate() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => continue,
+            };
+            if line.contains(pattern) {
+                output.push_str(&format!("{name}:{}: {line}\n", line_num + 1));
+            }
+        }
+    }
+    output
 }

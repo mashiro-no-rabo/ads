@@ -12,6 +12,13 @@ pub enum IpcCommand {
         reply: oneshot::Sender<HashMap<String, ProcStatus>>,
     },
     Stop,
+    Logs {
+        reply: oneshot::Sender<String>,
+    },
+    Search {
+        pattern: String,
+        reply: oneshot::Sender<String>,
+    },
 }
 
 /// Hash the canonical config path for deterministic derived paths.
@@ -114,6 +121,40 @@ async fn handle_client_inner(
         "STOP" => {
             writer.write_all(b"stopping...\n").await?;
             let _ = cmd_tx.send(IpcCommand::Stop).await;
+        }
+        "LOGS" => {
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx.send(IpcCommand::Logs { reply: reply_tx }).await?;
+            match reply_rx.await {
+                Ok(response) => {
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(_) => {
+                    writer
+                        .write_all(b"error: server shutting down\n")
+                        .await?;
+                }
+            }
+        }
+        other if other.starts_with("SEARCH ") => {
+            let pattern = other[7..].to_string();
+            let (reply_tx, reply_rx) = oneshot::channel();
+            cmd_tx
+                .send(IpcCommand::Search {
+                    pattern,
+                    reply: reply_tx,
+                })
+                .await?;
+            match reply_rx.await {
+                Ok(response) => {
+                    writer.write_all(response.as_bytes()).await?;
+                }
+                Err(_) => {
+                    writer
+                        .write_all(b"error: server shutting down\n")
+                        .await?;
+                }
+            }
         }
         other => {
             writer
