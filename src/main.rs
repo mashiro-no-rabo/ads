@@ -21,6 +21,8 @@ COMMANDS:
     stop      Stop running instance
     status    Show process states
     logs      Show log paths or search logs
+    traces    List recent traces
+    trace     Show trace details by ID
     channel   Start MCP server on stdio
 
 OPTIONS:
@@ -58,6 +60,7 @@ fn main() {
 
     match subcommand.as_deref() {
         Some("logs") => cmd_logs(config_path, args),
+        Some("trace") => cmd_trace(config_path, args),
         Some("channel") => cmd_channel(config_path, args),
         _ => {
             let remaining = args.finish();
@@ -70,6 +73,7 @@ fn main() {
                 None | Some("start") => cmd_start(config_path),
                 Some("stop") => cmd_stop(config_path),
                 Some("status") => cmd_status(config_path),
+                Some("traces") => cmd_traces(config_path),
                 Some(other) => {
                     eprintln!("Unknown command: {other}");
                     eprint!("{USAGE}");
@@ -226,6 +230,52 @@ fn cmd_status(config_path: PathBuf) {
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     rt.block_on(async {
         match ipc::send_command(&sock_path, "STATUS").await {
+            Ok(response) => print!("{response}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+fn cmd_traces(config_path: PathBuf) {
+    let sock_path = ipc::socket_path(&config_path);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        match ipc::send_command(&sock_path, "TRACES").await {
+            Ok(response) => print!("{response}"),
+            Err(e) => {
+                eprintln!("Error: {e}");
+                std::process::exit(1);
+            }
+        }
+    });
+}
+
+fn cmd_trace(config_path: PathBuf, mut args: pico_args::Arguments) {
+    let trace_id: Option<String> = args.opt_free_from_str().unwrap_or_default();
+
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        eprintln!("Unknown arguments: {remaining:?}");
+        eprintln!("Usage: ads trace <TRACE_ID>");
+        std::process::exit(1);
+    }
+
+    let trace_id = match trace_id {
+        Some(id) => id,
+        None => {
+            eprintln!("Missing trace ID");
+            eprintln!("Usage: ads trace <TRACE_ID>");
+            std::process::exit(1);
+        }
+    };
+
+    let sock_path = ipc::socket_path(&config_path);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        match ipc::send_command(&sock_path, &format!("TRACE {trace_id}")).await {
             Ok(response) => print!("{response}"),
             Err(e) => {
                 eprintln!("Error: {e}");

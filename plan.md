@@ -34,8 +34,8 @@ Receive OTLP traces from managed processes, store in memory, expose via IPC and 
 - [x] 4. Add IPC commands in `src/ipc.rs`
   - `TRACES` → list recent traces (id, service, root span name, span count, duration)
   - `TRACE <id>` → full span details for a trace
-- [ ] 5. Add MCP tools in `src/channel.rs`
+- [x] 5. Add MCP tools in `src/channel.rs`
   - `ads_traces()` — list recent traces
   - `ads_trace(trace_id)` — get trace detail
-- [ ] 6. Add `ads traces` and `ads trace <id>` CLI subcommands
+- [x] 6. Add `ads traces` and `ads trace <id>` CLI subcommands
 - [ ] 7. Update `feats/otel.md` feature doc, clean up `todos/otel.md`
