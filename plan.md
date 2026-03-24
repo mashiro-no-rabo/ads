@@ -41,7 +41,7 @@ Implements `todos/channel.md` — expose ads as a Claude Code MCP channel over s
 ## Progress
 
 - [x] Step 1: Add dependencies
-- [ ] Step 2: Implement channel module
+- [x] Step 2: Implement channel module
 - [ ] Step 3: Wire up CLI
 - [ ] Step 4: Build and test
 - [ ] Step 5: Update docs
