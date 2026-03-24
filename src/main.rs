@@ -20,6 +20,7 @@ COMMANDS:
     stop      Stop running instance
     status    Show process states
     logs      Show log paths or search logs
+    channel   Start MCP server on stdio
 
 OPTIONS:
     -c, --config <PATH>  Config file path (default: ads.toml)
@@ -56,6 +57,7 @@ fn main() {
 
     match subcommand.as_deref() {
         Some("logs") => cmd_logs(config_path, args),
+        Some("channel") => cmd_channel(config_path, args),
         _ => {
             let remaining = args.finish();
             if !remaining.is_empty() {
@@ -230,6 +232,23 @@ fn cmd_logs(config_path: PathBuf, mut args: pico_args::Arguments) {
             std::process::exit(1);
         }
     }
+}
+
+fn cmd_channel(config_path: PathBuf, args: pico_args::Arguments) {
+    let remaining = args.finish();
+    if !remaining.is_empty() {
+        eprintln!("Unknown arguments: {remaining:?}");
+        std::process::exit(1);
+    }
+
+    let sock_path = ipc::socket_path(&config_path);
+    let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
+    rt.block_on(async {
+        if let Err(e) = channel::run(sock_path).await {
+            eprintln!("Error: {e}");
+            std::process::exit(1);
+        }
+    });
 }
 
 /// Search across all log files in a directory for lines containing `pattern`.
