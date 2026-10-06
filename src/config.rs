@@ -259,7 +259,7 @@ mod tests {
 
     const SAMPLE: &str = r#"
 [env]
-GLOBAL = "{{service}}:{{ports.otel}}"
+GLOBAL = "{{service}}:{{ports.cache}}"
 
 [services.db]
 cmd = ["postgres", "-p", "{{ports.db}}"]
@@ -275,12 +275,12 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
         let cfg = parse(SAMPLE, PathBuf::from("/r")).unwrap();
         assert_eq!(
             cfg.port_names().into_iter().collect::<Vec<_>>(),
-            ["api", "db", "otel"]
+            ["api", "cache", "db"]
         );
         let ports = BTreeMap::from([
             ("api".to_string(), 8000),
             ("db".to_string(), 8001),
-            ("otel".to_string(), 8002),
+            ("cache".to_string(), 8002),
         ]);
         let svcs = cfg.render(&ports, Path::new("/r/.ads"), &[]).unwrap();
         let api = &svcs[0];
