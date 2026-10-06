@@ -16,8 +16,11 @@ pub const FILE: &str = "ads.toml";
 pub struct Config {
     pub root: PathBuf,
     env: Vec<(String, Template)>,
+    run: Vec<ServiceSpec>,
     pub services: Vec<ServiceSpec>,
 }
+
+pub const RUN: &str = "run";
 
 pub struct ServiceSpec {
     pub name: String,
@@ -68,14 +71,33 @@ pub fn load(path: &Path) -> Res<Config> {
 fn parse(text: &str, root: PathBuf) -> Res<Config> {
     let table: Table = text.parse().map_err(|e: toml::de::Error| e.to_string())?;
     let mut env = Vec::new();
+    let mut run = Vec::new();
     let mut services = Vec::new();
     for (key, value) in &table {
         match key.as_str() {
             "env" => env = parse_env(value, "env")?,
+            "run" => {
+                let steps = value
+                    .as_array()
+                    .ok_or("`run` must be an array of tables, write it as `[[run]]`")?;
+                for (i, v) in steps.iter().enumerate() {
+                    run.push(parse_spec(RUN, &format!("run[{i}]"), v)?);
+                }
+            }
             "services" => {
                 let t = value.as_table().ok_or("`services` must be a table")?;
                 for (name, v) in t {
-                    services.push(parse_service(name, v)?);
+                    if !template::valid_name(name) {
+                        return Err(format!(
+                            "invalid service name `{name}` (use letters, digits, `_`, `-`)"
+                        ));
+                    }
+                    if name == RUN {
+                        return Err(format!(
+                            "service name `{RUN}` is reserved for `[[run]]` steps"
+                        ));
+                    }
+                    services.push(parse_spec(name, &format!("services.{name}"), v)?);
                 }
             }
             _ => return Err(format!("unknown key `{key}`")),
@@ -87,17 +109,12 @@ fn parse(text: &str, root: PathBuf) -> Res<Config> {
     Ok(Config {
         root,
         env,
+        run,
         services,
     })
 }
 
-fn parse_service(name: &str, v: &Value) -> Res<ServiceSpec> {
-    if !template::valid_name(name) {
-        return Err(format!(
-            "invalid service name `{name}` (use letters, digits, `_`, `-`)"
-        ));
-    }
-    let path = format!("services.{name}");
+fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
     let t = v
         .as_table()
         .ok_or_else(|| format!("`{path}` must be a table"))?;
@@ -186,7 +203,12 @@ impl Config {
         self.env
             .iter()
             .map(|(_, t)| t)
-            .chain(self.services.iter().flat_map(|s| s.templates()))
+            .chain(
+                self.run
+                    .iter()
+                    .chain(&self.services)
+                    .flat_map(|s| s.templates()),
+            )
             .flat_map(|t| t.ports())
             .map(str::to_string)
             .collect()
@@ -198,49 +220,61 @@ impl Config {
         state: &Path,
         only: &[String],
     ) -> Res<Vec<Service>> {
-        let lookup = |n: &str| std::env::var(n).ok();
         self.services
             .iter()
             .filter(|s| only.is_empty() || only.contains(&s.name))
-            .map(|s| {
-                let ctx = Ctx {
-                    ports,
-                    root: &self.root,
-                    state,
-                    service: &s.name,
-                    env: &lookup,
-                };
-                let mut env = vec![
-                    ("ADS_SERVICE".to_string(), s.name.clone()),
-                    ("ADS_ROOT".to_string(), self.root.to_string_lossy().into()),
-                    ("ADS_STATE".to_string(), state.to_string_lossy().into()),
-                ];
-                env.extend(
-                    ports
-                        .iter()
-                        .map(|(n, p)| (ports::env_name(n), p.to_string())),
-                );
-                for (k, t) in self.env.iter().chain(&s.env) {
-                    env.push((k.clone(), t.render(&ctx)?));
-                }
-                let cmd = match &s.cmd {
-                    CmdSpec::Shell(t) => Cmd::Shell(t.render(&ctx)?),
-                    CmdSpec::Argv(a) => {
-                        Cmd::Argv(a.iter().map(|t| t.render(&ctx)).collect::<Res<_>>()?)
-                    }
-                };
-                let cwd = match &s.cwd {
-                    Some(t) => self.root.join(t.render(&ctx)?),
-                    None => self.root.clone(),
-                };
-                Ok(Service {
-                    name: s.name.clone(),
-                    cmd,
-                    cwd,
-                    env,
-                })
-            })
+            .map(|s| self.render_one(s, ports, state))
             .collect()
+    }
+
+    pub fn render_run(&self, ports: &BTreeMap<String, u16>, state: &Path) -> Res<Vec<Service>> {
+        self.run
+            .iter()
+            .map(|s| self.render_one(s, ports, state))
+            .collect()
+    }
+
+    fn render_one(
+        &self,
+        s: &ServiceSpec,
+        ports: &BTreeMap<String, u16>,
+        state: &Path,
+    ) -> Res<Service> {
+        let lookup = |n: &str| std::env::var(n).ok();
+        let ctx = Ctx {
+            ports,
+            root: &self.root,
+            state,
+            service: &s.name,
+            env: &lookup,
+        };
+        let mut env = vec![
+            ("ADS_SERVICE".to_string(), s.name.clone()),
+            ("ADS_ROOT".to_string(), self.root.to_string_lossy().into()),
+            ("ADS_STATE".to_string(), state.to_string_lossy().into()),
+        ];
+        env.extend(
+            ports
+                .iter()
+                .map(|(n, p)| (ports::env_name(n), p.to_string())),
+        );
+        for (k, t) in self.env.iter().chain(&s.env) {
+            env.push((k.clone(), t.render(&ctx)?));
+        }
+        let cmd = match &s.cmd {
+            CmdSpec::Shell(t) => Cmd::Shell(t.render(&ctx)?),
+            CmdSpec::Argv(a) => Cmd::Argv(a.iter().map(|t| t.render(&ctx)).collect::<Res<_>>()?),
+        };
+        let cwd = match &s.cwd {
+            Some(t) => self.root.join(t.render(&ctx)?),
+            None => self.root.clone(),
+        };
+        Ok(Service {
+            name: s.name.clone(),
+            cmd,
+            cwd,
+            env,
+        })
     }
 }
 
@@ -304,6 +338,26 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
     }
 
     #[test]
+    fn run_steps() {
+        let cfg = parse(
+            "[[run]]\ncmd = \"migrate --port {{ports.db}}\"\ncwd = \"backend\"\n\n[[run]]\ncmd = [\"seed\", \"{{service}}\"]\n\n[services.db]\ncmd = \"db {{ports.db}}\"\n",
+            PathBuf::from("/r"),
+        )
+        .unwrap();
+        assert_eq!(cfg.port_names().into_iter().collect::<Vec<_>>(), ["db"]);
+        let ports = BTreeMap::from([("db".to_string(), 8000)]);
+        let steps = cfg.render_run(&ports, Path::new("/r/.ads")).unwrap();
+        assert_eq!(steps.len(), 2);
+        assert!(matches!(&steps[0].cmd, Cmd::Shell(s) if s == "migrate --port 8000"));
+        assert_eq!(steps[0].cwd, PathBuf::from("/r/backend"));
+        assert!(matches!(&steps[1].cmd, Cmd::Argv(a) if a == &["seed", "run"]));
+        assert_eq!(
+            cfg.render(&ports, Path::new("/r/.ads"), &[]).unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
     fn errors() {
         let e = |s: &str| parse(s, PathBuf::from("/r")).err().unwrap();
         assert_eq!(
@@ -325,5 +379,17 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
             "services.a.cmd: unknown reference `{{bad}}`"
         );
         assert!(e("[services.\"a b\"]\ncmd = \"x\"").contains("invalid service name"));
+        assert_eq!(
+            e("[run]\ncmd = \"x\"\n[services.a]\ncmd = \"x\""),
+            "`run` must be an array of tables, write it as `[[run]]`"
+        );
+        assert_eq!(
+            e("[[run]]\ncwd = \".\"\n[services.a]\ncmd = \"x\""),
+            "`run[0].cmd` is required"
+        );
+        assert_eq!(
+            e("[services.run]\ncmd = \"x\""),
+            "service name `run` is reserved for `[[run]]` steps"
+        );
     }
 }

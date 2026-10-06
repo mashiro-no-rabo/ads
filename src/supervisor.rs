@@ -26,6 +26,7 @@ enum Event {
         idx: usize,
         status: io::Result<ExitStatus>,
     },
+    StepExited(io::Result<ExitStatus>),
     GroupGone(i32),
     Control {
         line: String,
@@ -105,9 +106,14 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
     let _lock = state.lock()?;
     let ports = ports::allocate(&cfg.port_names())?;
     let services = cfg.render(&ports, &state.dir, only)?;
+    let steps = cfg.render_run(&ports, &state.dir)?;
     write_ports(&state, &ports).map_err(|e| format!("writing ports: {e}"))?;
-    for s in &services {
-        File::create(state.log_path(&s.name)).map_err(|e| format!("{} log: {e}", s.name))?;
+    let log_names = services
+        .iter()
+        .map(|s| s.name.as_str())
+        .chain((!steps.is_empty()).then_some(config::RUN));
+    for name in log_names {
+        File::create(state.log_path(name)).map_err(|e| format!("{name} log: {e}"))?;
     }
 
     let echo = !detached;
@@ -139,6 +145,31 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
             }
         });
     }
+    let mut lifeline = Lifeline::spawn().map_err(|e| format!("starting watchdog: {e}"))?;
+
+    for (name, port) in &ports {
+        daemon.say(&format!("port {name}={port}"));
+    }
+
+    let run_prefix = match echo {
+        true => logs::prefix(config::RUN, width, color.then_some(90)),
+        false => String::new(),
+    };
+    if let Err(e) = run_steps(
+        &steps,
+        &state,
+        &daemon,
+        &run_prefix,
+        echo,
+        &tx,
+        &rx,
+        &mut lifeline,
+    ) {
+        lifeline.close();
+        daemon.say(&e);
+        return Err(e);
+    }
+
     let ctl = state.file("ctl.sock");
     {
         let tx = tx.clone();
@@ -146,11 +177,6 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
             let _ = tx.send(Event::Control { line, reply });
         })
         .map_err(|e| format!("control socket {}: {e}", ctl.display()))?;
-    }
-    let lifeline = Lifeline::spawn().map_err(|e| format!("starting watchdog: {e}"))?;
-
-    for (name, port) in &ports {
-        daemon.say(&format!("port {name}={port}"));
     }
 
     let procs = services
@@ -190,6 +216,52 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
     sup.write_status();
     sup.run(rx, echo);
     let _ = fs::remove_file(&ctl);
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_steps(
+    steps: &[Service],
+    state: &State,
+    daemon: &Daemon,
+    prefix: &str,
+    echo: bool,
+    tx: &mpsc::Sender<Event>,
+    rx: &mpsc::Receiver<Event>,
+    lifeline: &mut Lifeline,
+) -> Res<()> {
+    for (i, step) in steps.iter().enumerate() {
+        let label = format!("run[{i}]");
+        daemon.say(&format!("{label}: {}", step.cmd.display()));
+        let pid = spawn(state, step, prefix, echo, tx, Event::StepExited)
+            .map_err(|e| format!("{label} failed to start: {e}"))?;
+        lifeline.add(pid);
+        let mut interrupted = false;
+        let status = loop {
+            match rx.recv() {
+                Ok(Event::StepExited(status)) => break status,
+                Ok(Event::Signal) if !interrupted => {
+                    interrupted = true;
+                    daemon.say(&format!("stopping {label} (Ctrl-C again to kill)"));
+                    stop_group(pid, tx);
+                }
+                Ok(Event::Signal) => {
+                    let _ = sys::killpg(pid, sys::SIGKILL);
+                }
+                Ok(_) => {}
+                Err(_) => return Err("event channel closed".into()),
+            }
+        };
+        // Steps must finish; anything they left running in the background goes too.
+        sys::terminate_groups(&[pid], GRACE);
+        lifeline.remove(pid);
+        match status {
+            _ if interrupted => return Err(format!("{label} interrupted")),
+            Ok(s) if s.success() => daemon.say(&format!("{label} done")),
+            Ok(s) => return Err(format!("{label} failed ({})", describe(s))),
+            Err(e) => return Err(format!("{label}: wait failed: {e}")),
+        }
+    }
     Ok(())
 }
 
@@ -250,6 +322,7 @@ impl Supervisor {
                     }
                     self.settle(idx, echo);
                 }
+                Event::StepExited(_) => {}
                 Event::GroupGone(g) => {
                     self.groups.remove(&g);
                     self.lifeline.remove(g);
@@ -267,7 +340,14 @@ impl Supervisor {
 
     fn start(&mut self, idx: usize, echo: bool) {
         let p = &mut self.procs[idx];
-        match spawn(&self.state, &p.svc, &p.prefix, echo, idx, &self.tx) {
+        match spawn(
+            &self.state,
+            &p.svc,
+            &p.prefix,
+            echo,
+            &self.tx,
+            move |status| Event::Exited { idx, status },
+        ) {
             Ok(pid) => {
                 self.lifeline.add(pid);
                 self.groups.insert(pid);
@@ -386,8 +466,8 @@ fn spawn(
     svc: &Service,
     prefix: &str,
     echo: bool,
-    idx: usize,
     tx: &mpsc::Sender<Event>,
+    on_exit: impl FnOnce(io::Result<ExitStatus>) -> Event + Send + 'static,
 ) -> io::Result<i32> {
     let mut cmd = match &svc.cmd {
         Cmd::Shell(s) => {
@@ -427,8 +507,7 @@ fn spawn(
     thread::spawn(move || logs::pump(err, log, echo_prefix));
     let tx = tx.clone();
     thread::spawn(move || {
-        let status = child.wait();
-        let _ = tx.send(Event::Exited { idx, status });
+        let _ = tx.send(on_exit(child.wait()));
     });
     Ok(pid)
 }
@@ -497,7 +576,6 @@ pub fn detach(config_path: &Path, only: &[String]) -> Res<()> {
         .stderr(out);
     sys::new_session_on_exec(&mut cmd);
     let mut child = cmd.spawn().map_err(|e| format!("spawning daemon: {e}"))?;
-    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(Some(st)) = child.try_wait() {
             let out = fs::read_to_string(&out_path).unwrap_or_default();
@@ -505,13 +583,6 @@ pub fn detach(config_path: &Path, only: &[String]) -> Res<()> {
         }
         if status.exists() && state.daemon_pid().is_some() {
             break;
-        }
-        if Instant::now() > deadline {
-            return Err(format!(
-                "daemon (pid {}) did not come up, see {}",
-                child.id(),
-                out_path.display()
-            ));
         }
         thread::sleep(Duration::from_millis(25));
     }
@@ -616,11 +687,21 @@ pub fn check(config_path: &Path) -> Res<()> {
     let state = State::new(&cfg.root);
     let ports = ports::allocate(&cfg.port_names())?;
     let services = cfg.render(&ports, &state.dir, &[])?;
+    let steps = cfg.render_run(&ports, &state.dir)?;
     println!("config: {}", config_path.display());
     if !ports.is_empty() {
         println!("ports:");
         for (n, p) in &ports {
             println!("  {n} = {p}");
+        }
+    }
+    if !steps.is_empty() {
+        println!("run:");
+        for (i, s) in steps.iter().enumerate() {
+            println!("  [{i}] {}", s.cmd.display());
+            if s.cwd != cfg.root {
+                println!("      cwd: {}", s.cwd.display());
+            }
         }
     }
     println!("services:");

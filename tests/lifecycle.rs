@@ -369,3 +369,118 @@ fn detached_daemon_reports_startup_errors() {
         "{out:?}"
     );
 }
+
+#[test]
+fn run_steps_before_services_in_order() {
+    let dir = setup(
+        "run-order",
+        r#"
+[[run]]
+cmd = "echo one {{ports.web}} > {{state}}/order; echo step-output"
+
+[[run]]
+cmd = "sleep 0.3; echo two >> {{state}}/order"
+
+[services.web]
+cmd = "echo svc >> {{state}}/order; sleep 1000"
+"#,
+    );
+    let mut d = up(&dir);
+    running_groups(&dir, 1);
+    let port = fs::read_to_string(dir.join(".ads/ports.env")).unwrap();
+    let port = port
+        .trim()
+        .strip_prefix("ADS_PORT_WEB=")
+        .unwrap()
+        .to_string();
+    assert!(wait_for(Duration::from_secs(3), || {
+        fs::read_to_string(dir.join(".ads/order")).is_ok_and(|s| s.ends_with("svc\n"))
+    }));
+    assert_eq!(
+        fs::read_to_string(dir.join(".ads/order")).unwrap(),
+        format!("one {port}\ntwo\nsvc\n")
+    );
+    let log = String::from_utf8(ads(&dir, &["logs", "run"]).stdout).unwrap();
+    assert_eq!(log, "step-output\n");
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+}
+
+#[test]
+fn failing_step_aborts_up() {
+    let dir = setup(
+        "run-fail",
+        "[[run]]\ncmd = \"exit 3\"\n\n[[run]]\ncmd = \"touch {{state}}/second\"\n\n[services.a]\ncmd = \"touch {{state}}/started; sleep 1000\"\n",
+    );
+    let out = ads(&dir, &["up"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("run[0] failed (code 3)"),
+        "{out:?}"
+    );
+    assert!(!dir.join(".ads/second").exists());
+    assert!(!dir.join(".ads/started").exists());
+    assert!(!dir.join(".ads/daemon.pid").exists());
+
+    let out = ads(&dir, &["up", "-d"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("run[0] failed (code 3)"));
+}
+
+fn step_pgid(dir: &Path) -> i32 {
+    let mut pgid = 0;
+    assert!(wait_for(Duration::from_secs(3), || {
+        fs::read_to_string(dir.join(".ads/step.pid"))
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .map(|p| pgid = p)
+            .is_some()
+    }));
+    pgid
+}
+
+#[test]
+fn ctrl_c_during_step() {
+    let dir = setup(
+        "run-interrupt",
+        "[[run]]\ncmd = \"echo $$ > {{state}}/step.pid; sleep 1000\"\n\n[services.a]\ncmd = \"touch {{state}}/started; sleep 1000\"\n",
+    );
+    let mut d = up(&dir);
+    let pgid = step_pgid(&dir);
+    assert!(group_alive(pgid));
+    unsafe { libc::kill(d.id() as i32, libc::SIGINT) };
+    assert!(wait_exit(&mut d, Duration::from_secs(3)));
+    assert!(!d.wait().unwrap().success());
+    assert!(!group_alive(pgid));
+    assert!(!dir.join(".ads/started").exists());
+}
+
+#[test]
+fn sigkill_daemon_during_step() {
+    let dir = setup(
+        "run-sigkill",
+        "[[run]]\ncmd = \"echo $$ > {{state}}/step.pid; sleep 1000\"\n\n[services.a]\ncmd = [\"sleep\", \"1000\"]\n",
+    );
+    let mut d = up(&dir);
+    let pgid = step_pgid(&dir);
+    d.kill().unwrap();
+    d.wait().unwrap();
+    assert!(
+        wait_for(Duration::from_secs(10), || !group_alive(pgid)),
+        "step survived daemon SIGKILL"
+    );
+}
+
+#[test]
+fn step_background_leftovers_killed() {
+    let dir = setup(
+        "run-leftover",
+        "[[run]]\ncmd = \"echo $$ > {{state}}/step.pid; sleep 1000 &\"\n\n[services.a]\ncmd = [\"sleep\", \"1000\"]\n",
+    );
+    let mut d = up(&dir);
+    running_groups(&dir, 1);
+    let pgid = step_pgid(&dir);
+    assert!(!group_alive(pgid), "backgrounded step child survived");
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+}
