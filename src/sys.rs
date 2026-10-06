@@ -75,6 +75,16 @@ pub fn unblock_signals_on_exec(cmd: &mut Command) {
     }
 }
 
+/// Detached daemon gets its own session so closing the terminal (SIGHUP) can't reach it.
+pub fn new_session_on_exec(cmd: &mut Command) {
+    unsafe {
+        cmd.pre_exec(|| match libc::setsid() {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+}
+
 pub fn wait_signal(set: &SigSet) -> io::Result<i32> {
     let mut sig = 0;
     match unsafe { libc::sigwait(&set.0, &mut sig) } {

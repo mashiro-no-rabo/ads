@@ -170,16 +170,25 @@ ads down                              SIGTERM the daemon from .ads/daemon.pid an
 ads ps                                services, pid, pgid, state, exit code
 ads ports [--json]                    resolved ports, `ports.env` format by default (agents use this one)
 ads logs [svc] [-f] [-n 100]          read .ads/logs/<svc>.log, -f follows
-ads restart <svc>                     restart one service (needs the control socket, phase 4)
+ads start|stop|restart <svc...>       control services through .ads/ctl.sock; blocks until done
 ads check                             validate the config and render templates without starting anything
 ```
 
 - `up` checks `.ads/daemon.pid` first. If that pid is alive (`kill(pid, 0)`), it refuses to
   start. The pid file uses an exclusive `flock` (`File::try_lock`, stable in std), so a stale
   pid file can't wedge startup.
-- `-d` re-execs `ads up` with `process_group(0)`, stdio redirected to `.ads/daemon.log`, and
-  `setsid` in `pre_exec` so it outlives the terminal. Then it prints the ports and returns.
-  The detached daemon keeps all three lifetime layers.
+- `-d` re-execs `ads up --detached-child` with `setsid` in `pre_exec`. `setsid` already
+  makes the daemon a group leader, and it fails if `process_group(0)` ran first.
+  - stdio goes to `.ads/daemon.out`, and nothing is echoed to the terminal.
+  - The parent waits until `.ads/status` appears, then prints `ports.env` and returns.
+  - If the child exits early, the parent prints `daemon.out` instead.
+  - The detached daemon keeps all three lifetime layers.
+- Control protocol: one request line (`<start|stop|restart> <svc>`) per connection and one
+  reply line (`ok …` or `err …`).
+  - The reply is sent only once the old group is fully gone and, for `start`/`restart`, the
+    new process is spawned.
+  - Restarts reuse the ports allocated at `up` and append to the existing log.
+  - During shutdown, any request still waiting gets `err shutting down`.
 
 ## State dir `.ads/`
 
@@ -189,7 +198,9 @@ ads check                             validate the config and render templates w
 .ads/ports.json       {"api":8000,…} (written by hand, no serde_json)
 .ads/status           TSV with a header: name pid state started exit (pid == pgid; rewritten on every change)
 .ads/logs/<svc>.log   raw combined stdout+stderr, truncated on `up`
-.ads/daemon.log       daemon events (spawned, exited, ports)
+.ads/daemon.log       daemon events (spawned, exited, ports, control requests)
+.ads/daemon.out       stdout/stderr of a detached daemon (crashes, startup errors)
+.ads/ctl.sock         control socket, removed on exit
 ```
 
 All writes go to a temp file and are renamed into place, so readers never see a partial file.
@@ -230,8 +241,8 @@ src/logs.rs        pumps, `ads logs` reader/follow
 ## Phases
 
 Status as of 2026-10-06:
-- Phases 1–3 are done and covered by `tests/lifecycle.rs`.
-- Not done yet: `-d`, `ads restart`, the control socket (phase 4), and OTel (phase 5).
+- Phases 1–4 are done and covered by `tests/lifecycle.rs`.
+- Not done yet: OTel (phase 5).
 
 1. **Skeleton + config**: cargo init, `.gitignore`, `justfile`, config parse, template
    collect and render, port allocation, `ads check`, `ads ports`. Unit tests:

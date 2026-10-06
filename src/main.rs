@@ -1,4 +1,5 @@
 mod config;
+mod control;
 mod logs;
 mod ports;
 mod state;
@@ -21,8 +22,10 @@ ads - agent dev stack
 usage: ads [-c ads.toml] <command>
 
 commands:
-  up [svc...]             start services in the foreground (Ctrl-C to stop)
+  up [-d] [svc...]        start services in the foreground (Ctrl-C to stop), -d to detach
   down                    stop the running daemon
+  start|stop|restart <svc...>
+                          control services of the running daemon
   ps                      show service status
   ports [--json]          show assigned ports (ADS_PORT_<NAME>=<port> by default)
   logs [svc...] [-f] [-n N]
@@ -63,8 +66,18 @@ fn run() -> Res<()> {
             Ok(())
         }
         Some("up") => {
+            let detach = args.contains(["-d", "--detach"]);
+            let detached_child = args.contains("--detached-child");
             let only = free(args)?;
-            supervisor::up(&config::find(explicit)?, &only)
+            let config = config::find(explicit)?;
+            match detach {
+                true => supervisor::detach(&config, &only),
+                false => supervisor::up(&config, &only, detached_child),
+            }
+        }
+        Some(cmd @ ("start" | "stop" | "restart")) => {
+            let services = free(args)?;
+            supervisor::ctl(&state()?, cmd, &services)
         }
         Some("down") => {
             free_none(args)?;

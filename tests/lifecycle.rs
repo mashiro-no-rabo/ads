@@ -269,3 +269,103 @@ fn logs_written() {
     assert!(ads(&dir, &["down"]).status.success());
     assert!(wait_exit(&mut d, Duration::from_secs(2)));
 }
+
+fn pid_of(dir: &Path, name: &str) -> (i32, String) {
+    let r = status(dir).into_iter().find(|r| r.0 == name).unwrap();
+    (r.1, r.2)
+}
+
+#[test]
+fn control_stop_start_restart() {
+    let dir = setup(
+        "control",
+        "[services.a]\ncmd = \"echo hello; sleep 1000\"\n\n[services.b]\ncmd = [\"sleep\", \"1000\"]\n",
+    );
+    let mut d = up(&dir);
+    running_groups(&dir, 2);
+    let (first, _) = pid_of(&dir, "a");
+
+    let out = ads(&dir, &["restart", "a"]);
+    assert!(out.status.success(), "{out:?}");
+    let (second, phase) = pid_of(&dir, "a");
+    assert_eq!(phase, "running");
+    assert_ne!(first, second);
+    assert!(!group_alive(first));
+    assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("pid {second}")));
+    assert!(wait_for(Duration::from_secs(3), || {
+        fs::read_to_string(dir.join(".ads/logs/a.log")).is_ok_and(|s| s == "hello\nhello\n")
+    }));
+
+    let out = ads(&dir, &["stop", "a"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(pid_of(&dir, "a").1, "exited");
+    assert!(!group_alive(second));
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "a stopped\n");
+
+    let out = ads(&dir, &["start", "a"]);
+    assert!(out.status.success(), "{out:?}");
+    let (third, phase) = pid_of(&dir, "a");
+    assert_eq!(phase, "running");
+    assert!(group_alive(third));
+
+    let out = ads(&dir, &["start", "a"]);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("already running"));
+
+    let out = ads(&dir, &["restart", "nope"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown service `nope`"));
+
+    assert_eq!(pid_of(&dir, "b").1, "running");
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+    assert!(!group_alive(third));
+    assert!(!dir.join(".ads/ctl.sock").exists());
+}
+
+#[test]
+fn detached_daemon() {
+    let dir = setup(
+        "detach",
+        "[services.a]\ncmd = \"sleep 1000 # {{ports.a}}\"\n",
+    );
+    let out = ads(&dir, &["up", "-d"]);
+    assert!(out.status.success(), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("ADS_PORT_A="), "{stdout}");
+    let daemon: i32 = fs::read_to_string(dir.join(".ads/daemon.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert_eq!(
+        unsafe { libc::getsid(daemon) },
+        daemon,
+        "not a session leader"
+    );
+    let (pid, phase) = pid_of(&dir, "a");
+    assert_eq!(phase, "running");
+
+    let again = ads(&dir, &["up", "-d"]);
+    assert!(!again.status.success());
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already running"));
+
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(!group_alive(pid));
+    assert!(wait_for(Duration::from_secs(2), || unsafe {
+        libc::kill(daemon, 0) != 0
+    }));
+}
+
+#[test]
+fn detached_daemon_reports_startup_errors() {
+    let dir = setup(
+        "detach-bad",
+        "[services.a]\ncmd = \"x {{env.ADS_TEST_UNSET}}\"\n",
+    );
+    let out = ads(&dir, &["up", "-d"]);
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("ADS_TEST_UNSET` is not set"),
+        "{out:?}"
+    );
+}

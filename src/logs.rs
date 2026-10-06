@@ -18,7 +18,7 @@ pub fn prefix(name: &str, width: usize, color: Option<u8>) -> String {
 }
 
 /// Each line goes out in a single `write_all` so concurrent pumps never interleave mid-line.
-pub fn pump(src: impl Read, log: Arc<File>, prefix: String) {
+pub fn pump(src: impl Read, log: Arc<File>, echo: Option<String>) {
     let mut r = BufReader::new(src);
     let mut buf = Vec::new();
     loop {
@@ -31,10 +31,12 @@ pub fn pump(src: impl Read, log: Arc<File>, prefix: String) {
             buf.push(b'\n');
         }
         let _ = (&*log).write_all(&buf);
-        let mut line = Vec::with_capacity(prefix.len() + buf.len());
-        line.extend_from_slice(prefix.as_bytes());
-        line.extend_from_slice(&buf);
-        let _ = io::stdout().lock().write_all(&line);
+        if let Some(prefix) = &echo {
+            let mut line = Vec::with_capacity(prefix.len() + buf.len());
+            line.extend_from_slice(prefix.as_bytes());
+            line.extend_from_slice(&buf);
+            let _ = io::stdout().lock().write_all(&line);
+        }
     }
 }
 

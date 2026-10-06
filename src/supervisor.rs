@@ -1,7 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt::Write as _,
-    fs::{self, File},
+    fs::{self, File, OpenOptions},
     io::{self, IsTerminal, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::Path,
@@ -14,7 +14,7 @@ use std::{
 use crate::{
     GRACE, Res,
     config::{self, Cmd, Service},
-    logs, ports,
+    control, logs, ports,
     state::{self, State},
     sys,
     watchdog::Lifeline,
@@ -27,6 +27,10 @@ enum Event {
         status: io::Result<ExitStatus>,
     },
     GroupGone(i32),
+    Control {
+        line: String,
+        reply: mpsc::Sender<String>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -50,28 +54,46 @@ impl Phase {
 
 struct Proc {
     svc: Service,
+    prefix: String,
     pid: Option<i32>,
     phase: Phase,
     started: Option<u64>,
     exit: Option<String>,
+    /// Start again once the current instance's whole group is gone (restart / start while stopping).
+    pending_start: bool,
+    waiters: Vec<mpsc::Sender<String>>,
 }
 
 struct Daemon {
     log: File,
     prefix: String,
+    echo: bool,
 }
 
 impl Daemon {
     fn say(&self, msg: &str) {
         let line = format!("{msg}\n");
         let _ = (&self.log).write_all(line.as_bytes());
-        let _ = io::stdout()
-            .lock()
-            .write_all(format!("{}{line}", self.prefix).as_bytes());
+        if self.echo {
+            let _ = io::stdout()
+                .lock()
+                .write_all(format!("{}{line}", self.prefix).as_bytes());
+        }
     }
 }
 
-pub fn up(config_path: &Path, only: &[String]) -> Res<()> {
+struct Supervisor {
+    state: State,
+    daemon: Daemon,
+    tx: mpsc::Sender<Event>,
+    procs: Vec<Proc>,
+    groups: BTreeSet<i32>,
+    lifeline: Lifeline,
+    shutting: bool,
+    forced: bool,
+}
+
+pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
     let cfg = config::load(config_path)?;
     for name in only {
         if !cfg.services.iter().any(|s| &s.name == name) {
@@ -84,8 +106,12 @@ pub fn up(config_path: &Path, only: &[String]) -> Res<()> {
     let ports = ports::allocate(&cfg.port_names())?;
     let services = cfg.render(&ports, &state.dir, only)?;
     write_ports(&state, &ports).map_err(|e| format!("writing ports: {e}"))?;
+    for s in &services {
+        File::create(state.log_path(&s.name)).map_err(|e| format!("{} log: {e}", s.name))?;
+    }
 
-    let color = io::stdout().is_terminal();
+    let echo = !detached;
+    let color = echo && io::stdout().is_terminal();
     let width = services
         .iter()
         .map(|s| s.name.len())
@@ -98,6 +124,7 @@ pub fn up(config_path: &Path, only: &[String]) -> Res<()> {
             true => format!("\x1b[1m{:<width$}\x1b[0m | ", "ads"),
             false => format!("{:<width$} | ", "ads"),
         },
+        echo,
     };
 
     let sigset = sys::block_shutdown_signals().map_err(|e| format!("blocking signals: {e}"))?;
@@ -112,113 +139,253 @@ pub fn up(config_path: &Path, only: &[String]) -> Res<()> {
             }
         });
     }
-    let mut lifeline = Lifeline::spawn().map_err(|e| format!("starting watchdog: {e}"))?;
+    let ctl = state.file("ctl.sock");
+    {
+        let tx = tx.clone();
+        control::serve(&ctl, move |line, reply| {
+            let _ = tx.send(Event::Control { line, reply });
+        })
+        .map_err(|e| format!("control socket {}: {e}", ctl.display()))?;
+    }
+    let lifeline = Lifeline::spawn().map_err(|e| format!("starting watchdog: {e}"))?;
 
     for (name, port) in &ports {
         daemon.say(&format!("port {name}={port}"));
     }
 
-    let mut groups = BTreeSet::new();
-    let mut procs: Vec<Proc> = Vec::with_capacity(services.len());
-    for (idx, svc) in services.into_iter().enumerate() {
-        let prefix = logs::prefix(
-            &svc.name,
-            width,
-            color.then_some(logs::COLORS[idx % logs::COLORS.len()]),
-        );
-        let mut p = Proc {
+    let procs = services
+        .into_iter()
+        .enumerate()
+        .map(|(idx, svc)| Proc {
+            prefix: match echo {
+                true => logs::prefix(
+                    &svc.name,
+                    width,
+                    color.then_some(logs::COLORS[idx % logs::COLORS.len()]),
+                ),
+                false => String::new(),
+            },
             svc,
             pid: None,
-            phase: Phase::Failed,
+            phase: Phase::Exited,
             started: None,
             exit: None,
-        };
-        match spawn(&state, &p.svc, prefix, idx, &tx) {
+            pending_start: false,
+            waiters: Vec::new(),
+        })
+        .collect();
+    let mut sup = Supervisor {
+        state,
+        daemon,
+        tx,
+        procs,
+        groups: BTreeSet::new(),
+        lifeline,
+        shutting: false,
+        forced: false,
+    };
+    for idx in 0..sup.procs.len() {
+        sup.start(idx, echo);
+    }
+    sup.write_status();
+    sup.run(rx, echo);
+    let _ = fs::remove_file(&ctl);
+    Ok(())
+}
+
+impl Supervisor {
+    fn run(mut self, rx: mpsc::Receiver<Event>, echo: bool) {
+        loop {
+            let busy = self
+                .procs
+                .iter()
+                .any(|p| matches!(p.phase, Phase::Running | Phase::Stopping));
+            if self.shutting && !busy && self.groups.is_empty() {
+                break;
+            }
+            let ev = match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(ev) => ev,
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if self.lifeline.check() {
+                        self.daemon.say("watchdog died, restarted");
+                    }
+                    continue;
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            };
+            match ev {
+                Event::Signal if !self.shutting => {
+                    self.shutting = true;
+                    self.daemon.say("stopping (Ctrl-C again to kill)");
+                    for idx in 0..self.procs.len() {
+                        let p = &mut self.procs[idx];
+                        p.pending_start = false;
+                        for w in p.waiters.drain(..) {
+                            let _ = w.send("err shutting down".into());
+                        }
+                        self.stop(idx);
+                    }
+                }
+                Event::Signal if !self.forced => {
+                    self.forced = true;
+                    self.daemon.say("killing");
+                    for &g in &self.groups {
+                        let _ = sys::killpg(g, sys::SIGKILL);
+                    }
+                }
+                Event::Signal => {}
+                Event::Exited { idx, status } => {
+                    let p = &mut self.procs[idx];
+                    let was_stopping = p.phase == Phase::Stopping;
+                    let exit = match status {
+                        Ok(s) => describe(s),
+                        Err(e) => format!("wait failed: {e}"),
+                    };
+                    self.daemon.say(&format!("{} exited ({exit})", p.svc.name));
+                    p.phase = Phase::Exited;
+                    p.exit = Some(exit);
+                    // The leader is gone but the group may still have members (backgrounded children).
+                    if !was_stopping {
+                        stop_group(p.pid.unwrap(), &self.tx);
+                    }
+                    self.settle(idx, echo);
+                }
+                Event::GroupGone(g) => {
+                    self.groups.remove(&g);
+                    self.lifeline.remove(g);
+                    if let Some(idx) = self.procs.iter().position(|p| p.pid == Some(g)) {
+                        self.settle(idx, echo);
+                    }
+                }
+                Event::Control { line, reply } => self.control(&line, reply, echo),
+            }
+            self.write_status();
+        }
+        self.lifeline.close();
+        self.daemon.say("stopped");
+    }
+
+    fn start(&mut self, idx: usize, echo: bool) {
+        let p = &mut self.procs[idx];
+        match spawn(&self.state, &p.svc, &p.prefix, echo, idx, &self.tx) {
             Ok(pid) => {
-                lifeline.add(pid);
-                groups.insert(pid);
+                self.lifeline.add(pid);
+                self.groups.insert(pid);
                 p.pid = Some(pid);
                 p.phase = Phase::Running;
                 p.started = Some(now());
-                daemon.say(&format!(
+                p.exit = None;
+                self.daemon.say(&format!(
                     "started {} (pid {pid}): {}",
                     p.svc.name,
                     p.svc.cmd.display()
                 ));
             }
-            Err(e) => daemon.say(&format!("failed to start {}: {e}", p.svc.name)),
+            Err(e) => {
+                p.phase = Phase::Failed;
+                p.exit = Some(format!("spawn: {e}"));
+                self.daemon
+                    .say(&format!("failed to start {}: {e}", p.svc.name));
+            }
         }
-        procs.push(p);
     }
-    write_status(&state, &procs);
 
-    let mut shutting = false;
-    let mut forced = false;
-    loop {
-        let busy = procs
-            .iter()
-            .any(|p| matches!(p.phase, Phase::Running | Phase::Stopping));
-        if shutting && !busy && groups.is_empty() {
-            break;
+    fn stop(&mut self, idx: usize) {
+        let p = &mut self.procs[idx];
+        if p.phase == Phase::Running {
+            p.phase = Phase::Stopping;
+            stop_group(p.pid.unwrap(), &self.tx);
         }
-        let ev = match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(ev) => ev,
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                if lifeline.check() {
-                    daemon.say("watchdog died, restarted");
-                }
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        match ev {
-            Event::Signal if !shutting => {
-                shutting = true;
-                daemon.say("stopping (Ctrl-C again to kill)");
-                for p in procs.iter_mut().filter(|p| p.phase == Phase::Running) {
-                    p.phase = Phase::Stopping;
-                    stop_group(p.pid.unwrap(), &tx);
-                }
-            }
-            Event::Signal if !forced => {
-                forced = true;
-                daemon.say("killing");
-                for &g in &groups {
-                    let _ = sys::killpg(g, sys::SIGKILL);
-                }
-            }
-            Event::Signal => {}
-            Event::Exited { idx, status } => {
-                let p = &mut procs[idx];
-                let was_stopping = p.phase == Phase::Stopping;
-                let exit = match status {
-                    Ok(s) => describe(s),
-                    Err(e) => format!("wait failed: {e}"),
-                };
-                daemon.say(&format!("{} exited ({exit})", p.svc.name));
-                p.phase = Phase::Exited;
-                p.exit = Some(exit);
-                // The leader is gone but the group may still have members (backgrounded children).
-                if !was_stopping {
-                    stop_group(p.pid.unwrap(), &tx);
-                }
-            }
-            Event::GroupGone(g) => {
-                groups.remove(&g);
-                lifeline.remove(g);
-            }
-        }
-        write_status(&state, &procs);
     }
-    lifeline.close();
-    daemon.say("stopped");
-    Ok(())
+
+    /// Acts once the service and every member of its group are gone.
+    fn settle(&mut self, idx: usize, echo: bool) {
+        let p = &self.procs[idx];
+        let gone = matches!(p.phase, Phase::Exited | Phase::Failed)
+            && p.pid.is_none_or(|g| !self.groups.contains(&g));
+        if !gone {
+            return;
+        }
+        if p.pending_start && !self.shutting {
+            self.procs[idx].pending_start = false;
+            self.start(idx, echo);
+        }
+        let p = &mut self.procs[idx];
+        let reply = match p.phase {
+            Phase::Running => format!("ok {} running (pid {})", p.svc.name, p.pid.unwrap()),
+            Phase::Failed => format!(
+                "err {} failed to start: {}",
+                p.svc.name,
+                p.exit.as_deref().unwrap_or("")
+            ),
+            _ => format!("ok {} stopped", p.svc.name),
+        };
+        for w in p.waiters.drain(..) {
+            let _ = w.send(reply.clone());
+        }
+    }
+
+    fn control(&mut self, line: &str, reply: mpsc::Sender<String>, echo: bool) {
+        let send = |r: String| {
+            let _ = reply.send(r);
+        };
+        if self.shutting {
+            return send("err shutting down".into());
+        }
+        let Some((cmd, name)) = line.split_once(' ') else {
+            return send(format!("err invalid request `{line}`"));
+        };
+        let Some(idx) = self.procs.iter().position(|p| p.svc.name == name) else {
+            return send(format!("err unknown service `{name}`"));
+        };
+        match cmd {
+            "stop" => {
+                self.procs[idx].pending_start = false;
+                self.stop(idx);
+            }
+            "start" => {
+                if self.procs[idx].phase == Phase::Running {
+                    return send(format!(
+                        "ok {name} already running (pid {})",
+                        self.procs[idx].pid.unwrap()
+                    ));
+                }
+                self.procs[idx].pending_start = true;
+            }
+            "restart" => {
+                self.procs[idx].pending_start = true;
+                self.stop(idx);
+            }
+            _ => return send(format!("err unknown command `{cmd}`")),
+        }
+        self.daemon.say(&format!("{cmd} {name} requested"));
+        self.procs[idx].waiters.push(reply);
+        self.settle(idx, echo);
+    }
+
+    fn write_status(&self) {
+        let mut s = format!("{STATUS_HEADER}\n");
+        for p in &self.procs {
+            let dash = || "-".to_string();
+            let _ = writeln!(
+                s,
+                "{}\t{}\t{}\t{}\t{}",
+                p.svc.name,
+                p.pid.map_or_else(dash, |v| v.to_string()),
+                p.phase.as_str(),
+                p.started.map_or_else(dash, |v| v.to_string()),
+                p.exit.clone().unwrap_or_else(dash),
+            );
+        }
+        let _ = state::write_atomic(&self.state.file("status"), s.as_bytes());
+    }
 }
 
 fn spawn(
     state: &State,
     svc: &Service,
-    prefix: String,
+    prefix: &str,
+    echo: bool,
     idx: usize,
     tx: &mpsc::Sender<Event>,
 ) -> io::Result<i32> {
@@ -234,7 +401,12 @@ fn spawn(
             c
         }
     };
-    let log = Arc::new(File::create(state.log_path(&svc.name))?);
+    let log = Arc::new(
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(state.log_path(&svc.name))?,
+    );
     sys::unblock_signals_on_exec(&mut cmd);
     let mut child = cmd
         .current_dir(&svc.cwd)
@@ -247,11 +419,12 @@ fn spawn(
     let pid = child.id() as i32;
     let out = child.stdout.take().expect("piped stdout");
     let err = child.stderr.take().expect("piped stderr");
+    let echo_prefix = echo.then(|| prefix.to_string());
     {
-        let (log, prefix) = (log.clone(), prefix.clone());
+        let (log, prefix) = (log.clone(), echo_prefix.clone());
         thread::spawn(move || logs::pump(out, log, prefix));
     }
-    thread::spawn(move || logs::pump(err, log, prefix));
+    thread::spawn(move || logs::pump(err, log, echo_prefix));
     let tx = tx.clone();
     thread::spawn(move || {
         let status = child.wait();
@@ -302,21 +475,76 @@ fn write_ports(state: &State, ports: &BTreeMap<String, u16>) -> io::Result<()> {
 
 const STATUS_HEADER: &str = "name\tpid\tstate\tstarted\texit";
 
-fn write_status(state: &State, procs: &[Proc]) {
-    let mut s = format!("{STATUS_HEADER}\n");
-    for p in procs {
-        let dash = || "-".to_string();
-        let _ = writeln!(
-            s,
-            "{}\t{}\t{}\t{}\t{}",
-            p.svc.name,
-            p.pid.map_or_else(dash, |v| v.to_string()),
-            p.phase.as_str(),
-            p.started.map_or_else(dash, |v| v.to_string()),
-            p.exit.clone().unwrap_or_else(dash),
-        );
+pub fn detach(config_path: &Path, only: &[String]) -> Res<()> {
+    let state = State::new(&config::root_of(config_path));
+    state.init()?;
+    if let Some(pid) = state.daemon_pid() {
+        return Err(format!("already running (pid {pid})"));
     }
-    let _ = state::write_atomic(&state.file("status"), s.as_bytes());
+    let status = state.file("status");
+    let _ = fs::remove_file(&status);
+    let out_path = state.file("daemon.out");
+    let out = File::create(&out_path).map_err(|e| format!("{}: {e}", out_path.display()))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("-c")
+        .arg(config_path)
+        .arg("up")
+        .arg("--detached-child")
+        .args(only)
+        .stdin(Stdio::null())
+        .stdout(out.try_clone().map_err(|e| e.to_string())?)
+        .stderr(out);
+    sys::new_session_on_exec(&mut cmd);
+    let mut child = cmd.spawn().map_err(|e| format!("spawning daemon: {e}"))?;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(Some(st)) = child.try_wait() {
+            let out = fs::read_to_string(&out_path).unwrap_or_default();
+            return Err(format!("daemon exited ({st})\n{}", out.trim_end()));
+        }
+        if status.exists() && state.daemon_pid().is_some() {
+            break;
+        }
+        if Instant::now() > deadline {
+            return Err(format!(
+                "daemon (pid {}) did not come up, see {}",
+                child.id(),
+                out_path.display()
+            ));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    print!(
+        "{}",
+        fs::read_to_string(state.file("ports.env")).unwrap_or_default()
+    );
+    println!("ads running (pid {})", child.id());
+    Ok(())
+}
+
+pub fn ctl(state: &State, cmd: &str, services: &[String]) -> Res<()> {
+    if services.is_empty() {
+        return Err(format!("usage: ads {cmd} <svc>..."));
+    }
+    if state.daemon_pid().is_none() {
+        return Err("not running".into());
+    }
+    let mut failed = false;
+    for svc in services {
+        let reply = control::request(&state.file("ctl.sock"), &format!("{cmd} {svc}"))?;
+        match reply.strip_prefix("err ") {
+            Some(e) => {
+                failed = true;
+                eprintln!("ads: {e}");
+            }
+            None => println!("{}", reply.strip_prefix("ok ").unwrap_or(&reply)),
+        }
+    }
+    match failed {
+        true => Err(format!("{cmd} failed")),
+        false => Ok(()),
+    }
 }
 
 pub fn down(state: &State) -> Res<()> {
