@@ -1,6 +1,7 @@
 mod config;
 mod control;
 mod logs;
+mod open;
 mod ports;
 mod state;
 mod supervisor;
@@ -28,6 +29,7 @@ commands:
                           control services of the running daemon
   ps                      show service status
   ports [--json]          show assigned ports (ADS_PORT_<NAME>=<port> by default)
+  open [name] | --all      open a configured URL or port (defaults to the first entry)
   logs [svc...] [-f] [-n N]
                           show the last N (100) log lines, -f to follow
   check                   validate the config and show rendered services
@@ -91,6 +93,18 @@ fn run() -> Res<()> {
             let json = args.contains("--json");
             free_none(args)?;
             supervisor::ports_cmd(&state()?, if json { "json" } else { "env" })
+        }
+        Some("open") => {
+            let all = args.contains("--all");
+            let names = free(args)?;
+            if names.len() > 1 || (all && !names.is_empty()) {
+                return Err("usage: ads open [name] | --all".into());
+            }
+            open::cmd(
+                &config::find(explicit)?,
+                names.first().map(String::as_str),
+                all,
+            )
         }
         Some("logs") => {
             let follow = args.contains(["-f", "--follow"]);

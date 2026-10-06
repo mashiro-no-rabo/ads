@@ -18,6 +18,7 @@ pub struct Config {
     env: Vec<(String, Template)>,
     run: Vec<ServiceSpec>,
     pub services: Vec<ServiceSpec>,
+    pub open: Vec<(String, Template)>,
 }
 
 pub const RUN: &str = "run";
@@ -73,9 +74,31 @@ fn parse(text: &str, root: PathBuf) -> Res<Config> {
     let mut env = Vec::new();
     let mut run = Vec::new();
     let mut services = Vec::new();
+    let mut open = Vec::new();
     for (key, value) in &table {
         match key.as_str() {
             "env" => env = parse_env(value, "env")?,
+            "open" => {
+                let t = value.as_table().ok_or("`open` must be a table")?;
+                for (name, v) in t {
+                    let path = format!("open.{name}");
+                    if !template::valid_name(name) {
+                        return Err(format!(
+                            "invalid open name `{name}` (use letters, digits, `_`, `-`)"
+                        ));
+                    }
+                    let src = match v {
+                        Value::String(s) if !s.trim().is_empty() => s.clone(),
+                        Value::Integer(p) if (1..=65535).contains(p) => p.to_string(),
+                        _ => {
+                            return Err(format!(
+                                "`{path}` must be a non-empty URL string or a port integer (1-65535)"
+                            ));
+                        }
+                    };
+                    open.push((name.clone(), Template::parse(&src, &path)?));
+                }
+            }
             "run" => {
                 let steps = value
                     .as_array()
@@ -106,11 +129,14 @@ fn parse(text: &str, root: PathBuf) -> Res<Config> {
     if services.is_empty() {
         return Err("no services defined".into());
     }
+    // Keep services sorted as before; only [open] uses config-file order.
+    services.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Config {
         root,
         env,
         run,
         services,
+        open,
     })
 }
 
@@ -169,6 +195,8 @@ fn parse_env(v: &Value, path: &str) -> Res<Vec<(String, Template)>> {
         .as_table()
         .ok_or_else(|| format!("`{path}` must be a table"))?;
     t.iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
         .map(|(k, v)| {
             let kp = format!("{path}.{k}");
             if k.is_empty() || k.contains(['=', '\0']) {
@@ -209,6 +237,7 @@ impl Config {
                     .chain(&self.services)
                     .flat_map(|s| s.templates()),
             )
+            .chain(self.open.iter().map(|(_, t)| t))
             .flat_map(|t| t.ports())
             .map(str::to_string)
             .collect()
@@ -303,6 +332,27 @@ cmd = "run --port {{ports.api}}"
 cwd = "backend"
 env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
 "#;
+
+    #[test]
+    fn open_config_and_port_discovery() {
+        let text = format!(
+            "{SAMPLE}\n[open]\nweb = \"http://localhost:{{{{ports.web}}}}/app\"\nfixed = 3000\n"
+        );
+        let cfg = parse(&text, PathBuf::from("/r")).unwrap();
+        assert!(cfg.port_names().contains("web"));
+        assert_eq!(cfg.open.len(), 2);
+        assert_eq!(cfg.open[0].0, "web");
+        assert_eq!(cfg.open[1].0, "fixed");
+        for value in ["0", "65536", "-1", "true", "[]", "\"\"", "\"{{unknown}}\""] {
+            let text = format!("{SAMPLE}\n[open]\nweb = {value}\n");
+            assert!(
+                parse(&text, PathBuf::from("/r"))
+                    .err()
+                    .unwrap()
+                    .contains("open.web")
+            );
+        }
+    }
 
     #[test]
     fn parse_and_render() {

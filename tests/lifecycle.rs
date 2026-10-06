@@ -22,6 +22,130 @@ fn ads(dir: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+fn open_ads(dir: &Path, args: &[&str]) -> Output {
+    use std::os::unix::fs::PermissionsExt;
+
+    let bin = dir.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let opener = bin.join("open");
+    fs::write(
+        &opener,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" >> \"$OPEN_CAPTURE\"\nexit \"${OPEN_EXIT:-0}\"\n",
+    )
+    .unwrap();
+    fs::set_permissions(&opener, fs::Permissions::from_mode(0o755)).unwrap();
+    Command::new(env!("CARGO_BIN_EXE_ads"))
+        .args(args)
+        .current_dir(dir)
+        .env("PATH", &bin)
+        .env("OPEN_CAPTURE", dir.join("opened"))
+        .env(
+            "OPEN_EXIT",
+            if dir.join("fail-open").exists() {
+                "1"
+            } else {
+                "0"
+            },
+        )
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn open_static_destinations() {
+    let dir = setup(
+        "open-static",
+        "[services.web]\ncmd = 'sleep 1000'\n[open]\nweb = 3000\ndocs = 'https://example.com/a b?q=x&next=y'\n",
+    );
+    for args in [
+        vec!["open", "missing"],
+        vec!["open", "--all", "web"],
+        vec!["open", "web", "docs"],
+        vec!["open", "--bad"],
+    ] {
+        assert!(!open_ads(&dir, &args).status.success());
+    }
+    assert!(!dir.join("opened").exists());
+    assert!(open_ads(&dir, &["open"]).status.success());
+    assert_eq!(
+        fs::read_to_string(dir.join("opened")).unwrap(),
+        "--\nhttp://localhost:3000\n"
+    );
+    fs::remove_file(dir.join("opened")).unwrap();
+    let out = open_ads(&dir, &["open", "docs"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(dir.join("opened")).unwrap(),
+        "--\nhttps://example.com/a b?q=x&next=y\n"
+    );
+    fs::remove_file(dir.join("opened")).unwrap();
+    assert!(open_ads(&dir, &["open", "--all"]).status.success());
+    assert_eq!(
+        fs::read_to_string(dir.join("opened")).unwrap(),
+        "--\nhttp://localhost:3000\n--\nhttps://example.com/a b?q=x&next=y\n"
+    );
+    fs::write(dir.join("fail-open"), "").unwrap();
+    let out = open_ads(&dir, &["open", "web"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("open \"http://localhost:3000\""));
+}
+
+#[test]
+fn open_single_and_explicit_config() {
+    let dir = setup(
+        "open-single",
+        "[services.web]\ncmd = 'sleep 1000'\n[open]\nweb = 3000\n",
+    );
+    fs::rename(dir.join("ads.toml"), dir.join("custom.toml")).unwrap();
+    assert!(
+        open_ads(&dir, &["-c", "custom.toml", "open"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("opened")).unwrap(),
+        "--\nhttp://localhost:3000\n"
+    );
+}
+
+#[test]
+fn open_uses_running_port_assignments() {
+    let dir = setup(
+        "open-ports",
+        r#"
+[services.web]
+cmd = "sleep 1000 # {{ports.web}}"
+[open]
+web = "http://localhost:{{ports.web}}/app"
+other = "{{ports.other}}"
+"#,
+    );
+    let out = open_ads(&dir, &["open", "web"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+    let mut d = up(&dir);
+    running_groups(&dir, 1);
+    let text = fs::read_to_string(dir.join(".ads/ports.env")).unwrap();
+    let port = |key: &str| {
+        text.lines()
+            .find_map(|l| l.strip_prefix(key))
+            .unwrap()
+            .to_string()
+    };
+    let web = port("ADS_PORT_WEB=");
+    let other = port("ADS_PORT_OTHER=");
+    let out = open_ads(&dir, &["open", "--all"]);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(
+        fs::read_to_string(dir.join("opened")).unwrap(),
+        format!("--\nhttp://localhost:{web}/app\n--\nhttp://localhost:{other}\n")
+    );
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+    // Stale port files must never be treated as a running stack.
+    assert!(!open_ads(&dir, &["open", "web"]).status.success());
+}
+
 /// Stops the daemon if a test panics, so it can't outlive the run.
 struct Daemon(Child);
 

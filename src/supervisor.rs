@@ -688,6 +688,12 @@ pub fn check(config_path: &Path) -> Res<()> {
     let ports = ports::allocate(&cfg.port_names())?;
     let services = cfg.render(&ports, &state.dir, &[])?;
     let steps = cfg.render_run(&ports, &state.dir)?;
+    let urls = crate::open::render(
+        &cfg,
+        &state,
+        &ports,
+        cfg.open.iter().map(|(n, t)| (n.as_str(), t)).collect(),
+    )?;
     println!("config: {}", config_path.display());
     if !ports.is_empty() {
         println!("ports:");
@@ -711,6 +717,12 @@ pub fn check(config_path: &Path) -> Res<()> {
         println!("    cwd: {}", s.cwd.display());
         for (k, v) in s.env.iter().filter(|(k, _)| !k.starts_with("ADS_")) {
             println!("    env: {k}={v}");
+        }
+    }
+    if !urls.is_empty() {
+        println!("open:");
+        for ((name, _), url) in cfg.open.iter().zip(urls) {
+            println!("  {name} = {url}");
         }
     }
     Ok(())
