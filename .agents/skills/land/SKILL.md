@@ -91,3 +91,8 @@ again. Stop for genuine blockers or ambiguous scope, not routine confirmation.
    A successful commit, moved bookmark, or started push alone is not landing
    success. Report the commit and destination only after remote verification.
    If blocked, explicitly report that the changes have not landed and why.
+
+## Update local repo
+
+In the local root repo (NOT worktrees), run `jj ff` and ensure we have the latest
+`master` commit same as remote.
