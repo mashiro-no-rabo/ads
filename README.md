@@ -2,6 +2,10 @@
 
 Run a development stack defined in `ads.toml`. Use `ads --help` for commands.
 
+Running `ads` without a command starts services in the foreground, like `ads up`.
+It searches the current directory and its parents for `ads.toml`, or uses the
+config specified with `-c`. If no config is found, it shows usage.
+
 ## Opening URLs and ports
 
 Define named destinations in an `[open]` section:

@@ -20,7 +20,9 @@ const GRACE: Duration = Duration::from_secs(5);
 const USAGE: &str = "\
 ads - agent dev stack
 
-usage: ads [-c ads.toml] <command>
+usage: ads [-c ads.toml] [command]
+
+With no command, start services if ads.toml is found; otherwise show this help.
 
 commands:
   up [-d] [svc...]        start services in the foreground (Ctrl-C to stop), -d to detach
@@ -120,8 +122,14 @@ fn run() -> Res<()> {
         }
         Some(other) => Err(format!("unknown command `{other}`, see `ads --help`")),
         None => {
-            print!("{USAGE}");
-            Ok(())
+            free_none(args)?;
+            match config::find(explicit) {
+                Ok(config) => supervisor::up(&config, &[], false),
+                Err(_) => {
+                    print!("{USAGE}");
+                    Ok(())
+                }
+            }
         }
     }
 }

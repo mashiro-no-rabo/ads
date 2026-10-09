@@ -184,6 +184,67 @@ fn up(dir: &Path) -> Daemon {
     )
 }
 
+#[test]
+fn default_command_starts_services() {
+    for explicit in [false, true] {
+        let dir = setup(
+            if explicit {
+                "default-explicit"
+            } else {
+                "default"
+            },
+            "[services.a]\ncmd = 'sleep 1000'\n",
+        );
+        let nested = dir.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ads"));
+        if explicit {
+            fs::rename(dir.join("ads.toml"), dir.join("custom.toml")).unwrap();
+            command.args(["-c", "../custom.toml"]);
+        }
+        let mut daemon = Daemon(
+            command
+                .current_dir(&nested)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        running_groups(&dir, 1);
+        assert!(daemon.try_wait().unwrap().is_none());
+        unsafe { libc::kill(daemon.id() as i32, libc::SIGINT) };
+        assert!(wait_exit(&mut daemon, Duration::from_secs(2)));
+        assert!(daemon.wait().unwrap().success());
+    }
+}
+
+#[test]
+fn default_command_without_config_shows_usage() {
+    let dir = std::env::temp_dir().join(format!("ads-no-config-{}", std::process::id()));
+    fs::create_dir_all(&dir).unwrap();
+    for args in [vec![], vec!["-c", "missing.toml"]] {
+        let out = ads(&dir, &args);
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("usage: ads"));
+        assert!(out.stderr.is_empty());
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn help_does_not_load_config() {
+    let dir = setup("help", "invalid config");
+    for args in [vec!["--help"], vec!["-h"], vec!["up", "--help"]] {
+        let out = ads(&dir, &args);
+        assert!(out.status.success(), "{out:?}");
+        assert!(String::from_utf8_lossy(&out.stdout).contains("usage: ads"));
+        assert!(out.stderr.is_empty());
+    }
+    let out = ads(&dir, &[]);
+    assert!(!out.status.success());
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("usage: ads"));
+}
+
 fn wait_for(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
