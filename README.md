@@ -6,6 +6,9 @@ Running `ads` without a command starts services in the foreground, like `ads up`
 It searches the current directory and its parents for `ads.toml`, or uses the
 config specified with `-c`. If no config is found, it shows usage.
 
+Use `ads port web` to print only the assigned port number for `web`, for example
+`8000`. The stack must be running. `ads ports` lists all assigned ports.
+
 ## Opening URLs and ports
 
 Define named destinations in an `[open]` section:

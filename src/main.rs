@@ -31,6 +31,7 @@ commands:
                           control services of the running daemon
   ps                      show service status
   ports [--json]          show assigned ports (ADS_PORT_<NAME>=<port> by default)
+  port <name>             print the assigned port number for a name
   open [name] | --all      open a configured URL or port (defaults to the first entry)
   logs [svc...] [-f] [-n N]
                           show the last N (100) log lines, -f to follow
@@ -95,6 +96,13 @@ fn run() -> Res<()> {
             let json = args.contains("--json");
             free_none(args)?;
             supervisor::ports_cmd(&state()?, if json { "json" } else { "env" })
+        }
+        Some("port") => {
+            let names = free(args)?;
+            if names.len() != 1 {
+                return Err("usage: ads port <name>".into());
+            }
+            supervisor::port_cmd(&state()?, &names[0])
         }
         Some("open") => {
             let all = args.contains("--all");

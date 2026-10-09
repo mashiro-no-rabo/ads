@@ -645,6 +645,22 @@ pub fn ps(state: &State) -> Res<()> {
     Ok(())
 }
 
+pub fn port_cmd(state: &State, name: &str) -> Res<()> {
+    if state.daemon_pid().is_none() {
+        return Err("not running".into());
+    }
+    let text =
+        fs::read_to_string(state.file("ports.env")).map_err(|e| format!("ports.env: {e}"))?;
+    let key = ports::env_name(name);
+    let port = text
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .find_map(|(k, v)| (k == key).then_some(v))
+        .ok_or_else(|| format!("unknown port name `{name}`"))?;
+    println!("{port}");
+    Ok(())
+}
+
 pub fn ports_cmd(state: &State, format: &str) -> Res<()> {
     if state.daemon_pid().is_none() {
         return Err("not running".into());

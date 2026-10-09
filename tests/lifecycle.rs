@@ -398,6 +398,47 @@ fn signal_mask_not_inherited() {
 }
 
 #[test]
+fn named_port() {
+    let dir = setup(
+        "named-port",
+        "[services.web]\ncmd = 'sleep 1000 # {{ports.web}} {{ports.api-http}}'\n",
+    );
+    let out = ads(&dir, &["port", "web"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("not running"));
+    let mut d = up(&dir);
+    running_groups(&dir, 1);
+    let ports = String::from_utf8(ads(&dir, &["ports"]).stdout).unwrap();
+    for (name, key) in [("web", "ADS_PORT_WEB"), ("api-http", "ADS_PORT_API_HTTP")] {
+        let expected = ports
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .find_map(|(k, v)| (k == key).then_some(v))
+            .unwrap();
+        let out = ads(&dir, &["port", name]);
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            format!("{expected}\n")
+        );
+    }
+    let out = ads(&dir, &["port", "missing"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("unknown port name `missing`"));
+    for args in [
+        vec!["port"],
+        vec!["port", "web", "api-http"],
+        vec!["port", "--json", "web"],
+    ] {
+        assert!(!ads(&dir, &args).status.success());
+    }
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+    assert!(!ads(&dir, &["port", "web"]).status.success());
+}
+
+#[test]
 fn ports_env_and_templates() {
     let dir = setup(
         "ports",
