@@ -24,6 +24,10 @@ usage: ads [-c ads.toml] [command]
 
 With no command, start services if ads.toml is found; otherwise show this help.
 
+options:
+  -h, --help              show this help
+  -V, --version           show the version
+
 commands:
   up [-d] [svc...]        start services in the foreground (Ctrl-C to stop), -d to detach
   down                    stop the running daemon
@@ -52,6 +56,10 @@ fn run() -> Res<()> {
     let mut args = pico_args::Arguments::from_env();
     if args.contains(["-h", "--help"]) {
         print!("{USAGE}");
+        return Ok(());
+    }
+    if args.contains(["-V", "--version"]) {
+        println!("{}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
     let explicit: Option<PathBuf> = args
