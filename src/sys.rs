@@ -1,7 +1,6 @@
 use std::{
     io,
     mem::{self, MaybeUninit},
-    net::Ipv4Addr,
     os::unix::process::CommandExt,
     process::Command,
     thread,
@@ -11,33 +10,72 @@ use std::{
 pub use libc::{SIGKILL, SIGTERM};
 
 /// Probes without `SO_REUSEADDR`: with it (std's default), macOS lets `127.0.0.1:P` bind while
-/// another socket holds `0.0.0.0:P`, which would report a busy port as free.
+/// another socket holds `0.0.0.0:P`, which would report a busy port as free. Without it, a wildcard
+/// bind conflicts with any listener of its family, so both families are probed to catch servers
+/// on `[::1]` (Node's `localhost`) as well.
 pub fn port_free(port: u16) -> bool {
+    bind_free(libc::AF_INET, port) && bind_free(libc::AF_INET6, port)
+}
+
+fn bind_free(family: libc::c_int, port: u16) -> bool {
     unsafe {
-        let fd = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+        let fd = libc::socket(family, libc::SOCK_STREAM, 0);
         if fd < 0 {
-            return false;
+            return family == libc::AF_INET6
+                && io::Error::last_os_error().raw_os_error() == Some(libc::EAFNOSUPPORT);
         }
-        let mut addr: libc::sockaddr_in = mem::zeroed();
-        #[cfg(any(
-            target_os = "macos",
-            target_os = "ios",
-            target_os = "freebsd",
-            target_os = "openbsd",
-            target_os = "netbsd",
-            target_os = "dragonfly"
-        ))]
-        {
-            addr.sin_len = mem::size_of::<libc::sockaddr_in>() as u8;
-        }
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_port = port.to_be();
-        addr.sin_addr.s_addr = u32::from(Ipv4Addr::LOCALHOST).to_be();
-        let ok = libc::bind(
-            fd,
-            (&raw const addr).cast(),
-            mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
-        ) == 0;
+        let ok = match family {
+            libc::AF_INET => {
+                let mut addr: libc::sockaddr_in = mem::zeroed();
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly"
+                ))]
+                {
+                    addr.sin_len = mem::size_of::<libc::sockaddr_in>() as u8;
+                }
+                addr.sin_family = libc::AF_INET as libc::sa_family_t;
+                addr.sin_port = port.to_be();
+                libc::bind(
+                    fd,
+                    (&raw const addr).cast(),
+                    mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                ) == 0
+            }
+            _ => {
+                let on: libc::c_int = 1;
+                libc::setsockopt(
+                    fd,
+                    libc::IPPROTO_IPV6,
+                    libc::IPV6_V6ONLY,
+                    (&raw const on).cast(),
+                    mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                let mut addr: libc::sockaddr_in6 = mem::zeroed();
+                #[cfg(any(
+                    target_os = "macos",
+                    target_os = "ios",
+                    target_os = "freebsd",
+                    target_os = "openbsd",
+                    target_os = "netbsd",
+                    target_os = "dragonfly"
+                ))]
+                {
+                    addr.sin6_len = mem::size_of::<libc::sockaddr_in6>() as u8;
+                }
+                addr.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                addr.sin6_port = port.to_be();
+                libc::bind(
+                    fd,
+                    (&raw const addr).cast(),
+                    mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                ) == 0
+            }
+        };
         libc::close(fd);
         ok
     }
@@ -158,6 +196,18 @@ mod tests {
     #[test]
     fn port_held_on_loopback_is_busy() {
         let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(!port_free(l.local_addr().unwrap().port()));
+    }
+
+    #[test]
+    fn port_held_on_ipv6_loopback_is_busy() {
+        let l = TcpListener::bind("[::1]:0").unwrap();
+        assert!(!port_free(l.local_addr().unwrap().port()));
+    }
+
+    #[test]
+    fn port_held_on_ipv6_wildcard_is_busy() {
+        let l = TcpListener::bind("[::]:0").unwrap();
         assert!(!port_free(l.local_addr().unwrap().port()));
     }
 }
