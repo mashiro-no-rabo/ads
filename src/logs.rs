@@ -1,10 +1,15 @@
 use std::{
     fs::{self, File},
     io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
+
+use regex::bytes::Regex;
 
 use crate::{Res, state::State};
 
@@ -17,8 +22,36 @@ pub fn prefix(name: &str, width: usize, color: Option<u8>) -> String {
     }
 }
 
+/// Shared by a service's stdout and stderr pumps; fires `notify` on the first matching line only.
+pub struct Watch {
+    re: Regex,
+    hit: AtomicBool,
+    notify: Box<dyn Fn() + Send + Sync>,
+}
+
+impl Watch {
+    pub fn new(re: Regex, notify: impl Fn() + Send + Sync + 'static) -> Self {
+        Self {
+            re,
+            hit: AtomicBool::new(false),
+            notify: Box::new(notify),
+        }
+    }
+
+    fn check(&self, line: &[u8]) {
+        if self.hit.load(Ordering::Relaxed) {
+            return;
+        }
+        let line = line.strip_suffix(b"\n").unwrap_or(line);
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if self.re.is_match(line) && !self.hit.swap(true, Ordering::Relaxed) {
+            (self.notify)();
+        }
+    }
+}
+
 /// Each line goes out in a single `write_all` so concurrent pumps never interleave mid-line.
-pub fn pump(src: impl Read, log: Arc<File>, echo: Option<String>) {
+pub fn pump(src: impl Read, log: Arc<File>, echo: Option<String>, watch: Option<Arc<Watch>>) {
     let mut r = BufReader::new(src);
     let mut buf = Vec::new();
     loop {
@@ -26,6 +59,9 @@ pub fn pump(src: impl Read, log: Arc<File>, echo: Option<String>) {
         match r.read_until(b'\n', &mut buf) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
+        }
+        if let Some(w) = &watch {
+            w.check(&buf);
         }
         if !buf.ends_with(b"\n") {
             buf.push(b'\n');
@@ -178,6 +214,22 @@ mod tests {
         let (bytes, _) = tail(&p, 0).unwrap();
         assert!(bytes.is_empty());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn watch_fires_once() {
+        let n = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let w = {
+            let n = n.clone();
+            Watch::new(Regex::new("^ready$").unwrap(), move || {
+                n.fetch_add(1, Ordering::Relaxed);
+            })
+        };
+        w.check(b"not ready\n");
+        assert_eq!(n.load(Ordering::Relaxed), 0);
+        w.check(b"ready\r\n");
+        w.check(b"ready\n");
+        assert_eq!(n.load(Ordering::Relaxed), 1);
     }
 
     #[test]

@@ -710,3 +710,57 @@ fn step_background_leftovers_killed() {
     assert!(ads(&dir, &["down"]).status.success());
     assert!(wait_exit(&mut d, Duration::from_secs(2)));
 }
+
+#[test]
+fn wait_for_ready() {
+    let dir = setup(
+        "ready",
+        r#"
+[services.db]
+cmd = "sleep 0.5; echo 'listening on 1'; echo 'listening on 2'; sleep 1000"
+ready = "^listening on \\d+$"
+
+[services.api]
+cmd = "sleep 1000"
+wait = ["db"]
+"#,
+    );
+    let mut d = up(&dir);
+    assert!(wait_for(Duration::from_secs(3), || {
+        status(&dir)
+            .iter()
+            .any(|r| r.0 == "api" && r.2 == "waiting")
+    }));
+    assert_eq!(pid_of(&dir, "db").1, "running");
+    let out = ads(&dir, &["start", "api"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "api waiting for db\n");
+    running_groups(&dir, 2);
+    let log = fs::read_to_string(dir.join(".ads/daemon.log")).unwrap();
+    assert_eq!(log.matches("db ready").count(), 1, "{log}");
+
+    // Readiness is matched once per stack, so restarting db never blocks api again.
+    assert!(ads(&dir, &["stop", "db"]).status.success());
+    let out = ads(&dir, &["restart", "api"]);
+    assert!(out.status.success(), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).contains("api running"));
+
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+}
+
+#[test]
+fn waiting_service_stops_on_shutdown() {
+    let dir = setup(
+        "ready-never",
+        "[services.db]\ncmd = 'sleep 1000'\nready = 'never'\n[services.api]\ncmd = 'sleep 1000'\nwait = ['db']\n",
+    );
+    let mut d = up(&dir);
+    running_groups(&dir, 1);
+    assert_eq!(pid_of(&dir, "api").1, "waiting");
+    let out = ads(&dir, &["stop", "api"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "api stopped\n");
+    let out = ads(&dir, &["start", "api"]);
+    assert_eq!(String::from_utf8_lossy(&out.stdout), "api waiting for db\n");
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+}

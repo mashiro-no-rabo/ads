@@ -28,6 +28,7 @@ enum Event {
     },
     StepExited(io::Result<ExitStatus>),
     GroupGone(i32),
+    Ready(usize),
     Control {
         line: String,
         reply: mpsc::Sender<String>,
@@ -36,6 +37,7 @@ enum Event {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
+    Waiting,
     Running,
     Stopping,
     Exited,
@@ -45,6 +47,7 @@ enum Phase {
 impl Phase {
     fn as_str(self) -> &'static str {
         match self {
+            Phase::Waiting => "waiting",
             Phase::Running => "running",
             Phase::Stopping => "stopping",
             Phase::Exited => "exited",
@@ -63,6 +66,9 @@ struct Proc {
     /// Start again once the current instance's whole group is gone (restart / start while stopping).
     pending_start: bool,
     waiters: Vec<mpsc::Sender<String>>,
+    /// Set on the first `ready` match and never cleared, so later restarts don't block dependents.
+    ready: bool,
+    wait: Vec<usize>,
 }
 
 struct Daemon {
@@ -179,10 +185,17 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
         .map_err(|e| format!("control socket {}: {e}", ctl.display()))?;
     }
 
+    let names: Vec<String> = services.iter().map(|s| s.name.clone()).collect();
     let procs = services
         .into_iter()
         .enumerate()
         .map(|(idx, svc)| Proc {
+            // Waits on services excluded by `ads up svc...` are dropped.
+            wait: svc
+                .wait
+                .iter()
+                .filter_map(|w| names.iter().position(|n| n == w))
+                .collect(),
             prefix: match echo {
                 true => logs::prefix(
                     &svc.name,
@@ -198,6 +211,7 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
             exit: None,
             pending_start: false,
             waiters: Vec::new(),
+            ready: false,
         })
         .collect();
     let mut sup = Supervisor {
@@ -211,7 +225,7 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
         forced: false,
     };
     for idx in 0..sup.procs.len() {
-        sup.start(idx, echo);
+        sup.launch(idx, echo);
     }
     sup.write_status();
     sup.run(rx, echo);
@@ -233,7 +247,7 @@ fn run_steps(
     for (i, step) in steps.iter().enumerate() {
         let label = format!("run[{i}]");
         daemon.say(&format!("{label}: {}", step.cmd.display()));
-        let pid = spawn(state, step, prefix, echo, tx, Event::StepExited)
+        let pid = spawn(state, step, prefix, echo, None, tx, Event::StepExited)
             .map_err(|e| format!("{label} failed to start: {e}"))?;
         lifeline.add(pid);
         let mut interrupted = false;
@@ -330,6 +344,18 @@ impl Supervisor {
                         self.settle(idx, echo);
                     }
                 }
+                Event::Ready(idx) => {
+                    if !self.procs[idx].ready {
+                        self.procs[idx].ready = true;
+                        self.daemon
+                            .say(&format!("{} ready", self.procs[idx].svc.name));
+                        for i in 0..self.procs.len() {
+                            if self.procs[i].phase == Phase::Waiting && self.unmet(i).is_empty() {
+                                self.start(i, echo);
+                            }
+                        }
+                    }
+                }
                 Event::Control { line, reply } => self.control(&line, reply, echo),
             }
             self.write_status();
@@ -338,13 +364,43 @@ impl Supervisor {
         self.daemon.say("stopped");
     }
 
+    fn unmet(&self, idx: usize) -> Vec<&str> {
+        self.procs[idx]
+            .wait
+            .iter()
+            .filter(|&&w| !self.procs[w].ready)
+            .map(|&w| self.procs[w].svc.name.as_str())
+            .collect()
+    }
+
+    fn launch(&mut self, idx: usize, echo: bool) {
+        let unmet = self.unmet(idx).join(", ");
+        if unmet.is_empty() {
+            return self.start(idx, echo);
+        }
+        let p = &mut self.procs[idx];
+        p.phase = Phase::Waiting;
+        self.daemon
+            .say(&format!("{} waiting for {unmet}", p.svc.name));
+    }
+
     fn start(&mut self, idx: usize, echo: bool) {
+        let watch = match self.procs[idx].ready {
+            true => None,
+            false => self.procs[idx].svc.ready.clone().map(|re| {
+                let tx = self.tx.clone();
+                Arc::new(logs::Watch::new(re, move || {
+                    let _ = tx.send(Event::Ready(idx));
+                }))
+            }),
+        };
         let p = &mut self.procs[idx];
         match spawn(
             &self.state,
             &p.svc,
             &p.prefix,
             echo,
+            watch,
             &self.tx,
             move |status| Event::Exited { idx, status },
         ) {
@@ -372,9 +428,13 @@ impl Supervisor {
 
     fn stop(&mut self, idx: usize) {
         let p = &mut self.procs[idx];
-        if p.phase == Phase::Running {
-            p.phase = Phase::Stopping;
-            stop_group(p.pid.unwrap(), &self.tx);
+        match p.phase {
+            Phase::Running => {
+                p.phase = Phase::Stopping;
+                stop_group(p.pid.unwrap(), &self.tx);
+            }
+            Phase::Waiting => p.phase = Phase::Exited,
+            _ => {}
         }
     }
 
@@ -388,11 +448,13 @@ impl Supervisor {
         }
         if p.pending_start && !self.shutting {
             self.procs[idx].pending_start = false;
-            self.start(idx, echo);
+            self.launch(idx, echo);
         }
+        let unmet = self.unmet(idx).join(", ");
         let p = &mut self.procs[idx];
         let reply = match p.phase {
             Phase::Running => format!("ok {} running (pid {})", p.svc.name, p.pid.unwrap()),
+            Phase::Waiting => format!("ok {} waiting for {unmet}", p.svc.name),
             Phase::Failed => format!(
                 "err {} failed to start: {}",
                 p.svc.name,
@@ -418,6 +480,10 @@ impl Supervisor {
         let Some(idx) = self.procs.iter().position(|p| p.svc.name == name) else {
             return send(format!("err unknown service `{name}`"));
         };
+        if self.procs[idx].phase == Phase::Waiting && matches!(cmd, "start" | "restart") {
+            let unmet = self.unmet(idx).join(", ");
+            return send(format!("ok {name} waiting for {unmet}"));
+        }
         match cmd {
             "stop" => {
                 self.procs[idx].pending_start = false;
@@ -466,6 +532,7 @@ fn spawn(
     svc: &Service,
     prefix: &str,
     echo: bool,
+    watch: Option<Arc<logs::Watch>>,
     tx: &mpsc::Sender<Event>,
     on_exit: impl FnOnce(io::Result<ExitStatus>) -> Event + Send + 'static,
 ) -> io::Result<i32> {
@@ -501,10 +568,10 @@ fn spawn(
     let err = child.stderr.take().expect("piped stderr");
     let echo_prefix = echo.then(|| prefix.to_string());
     {
-        let (log, prefix) = (log.clone(), echo_prefix.clone());
-        thread::spawn(move || logs::pump(out, log, prefix));
+        let (log, prefix, watch) = (log.clone(), echo_prefix.clone(), watch.clone());
+        thread::spawn(move || logs::pump(out, log, prefix, watch));
     }
-    thread::spawn(move || logs::pump(err, log, echo_prefix));
+    thread::spawn(move || logs::pump(err, log, echo_prefix, watch));
     let tx = tx.clone();
     thread::spawn(move || {
         let _ = tx.send(on_exit(child.wait()));
@@ -731,6 +798,12 @@ pub fn check(config_path: &Path) -> Res<()> {
         println!("  {}:", s.name);
         println!("    cmd: {}", s.cmd.display());
         println!("    cwd: {}", s.cwd.display());
+        if let Some(re) = &s.ready {
+            println!("    ready: {re}");
+        }
+        if !s.wait.is_empty() {
+            println!("    wait: {}", s.wait.join(", "));
+        }
         for (k, v) in s.env.iter().filter(|(k, _)| !k.starts_with("ADS_")) {
             println!("    env: {k}={v}");
         }

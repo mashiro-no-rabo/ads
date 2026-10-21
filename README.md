@@ -9,6 +9,25 @@ config specified with `-c`. If no config is found, it shows usage.
 Use `ads port web` to print only the assigned port number for `web`, for example
 `8000`. The stack must be running. `ads ports` lists all assigned ports.
 
+## Waiting for services
+
+```toml
+[services.db]
+cmd = "postgres -p {{ports.db}}"
+ready = "ready to accept connections"
+
+[services.api]
+cmd = "run --db-port {{ports.db}}"
+wait = ["db"]
+```
+
+`ready` is a regex matched against each stdout/stderr line. A service becomes
+ready on its first match and stays ready for the rest of the stack's life, so
+restarting it later does not block dependents. `wait` lists services that must
+be ready before this one starts. They must be defined above it in `ads.toml`
+and must have `ready` set. Services still waiting show as `waiting` in
+`ads ps`. Waits on services left out by `ads up svc...` are ignored.
+
 ## Opening URLs and ports
 
 Define named destinations in an `[open]` section:

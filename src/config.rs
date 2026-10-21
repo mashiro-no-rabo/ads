@@ -4,6 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use regex::bytes::Regex;
 use toml::{Table, Value};
 
 use crate::{
@@ -28,6 +29,8 @@ pub struct ServiceSpec {
     cmd: CmdSpec,
     cwd: Option<Template>,
     env: Vec<(String, Template)>,
+    ready: Option<Regex>,
+    wait: Vec<String>,
 }
 
 enum CmdSpec {
@@ -40,6 +43,8 @@ pub struct Service {
     pub cmd: Cmd,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
+    pub ready: Option<Regex>,
+    pub wait: Vec<String>,
 }
 
 pub enum Cmd {
@@ -129,6 +134,25 @@ fn parse(text: &str, root: PathBuf) -> Res<Config> {
     if services.is_empty() {
         return Err("no services defined".into());
     }
+    // Waiting only on services defined above rules out cycles without building a graph.
+    for (i, s) in services.iter().enumerate() {
+        for w in &s.wait {
+            let path = format!("services.{}.wait", s.name);
+            match services.iter().position(|d| &d.name == w) {
+                None => return Err(format!("`{path}`: unknown service `{w}`")),
+                Some(j) if j >= i => {
+                    return Err(format!(
+                        "`{path}`: `{w}` must be defined above `{}`",
+                        s.name
+                    ));
+                }
+                Some(j) if services[j].ready.is_none() => {
+                    return Err(format!("`{path}`: `{w}` has no `ready` pattern"));
+                }
+                _ => {}
+            }
+        }
+    }
     // Keep services sorted as before; only [open] uses config-file order.
     services.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Config {
@@ -147,6 +171,9 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
     let mut cmd = None;
     let mut cwd = None;
     let mut env = Vec::new();
+    let mut ready = None;
+    let mut wait = Vec::new();
+    let service = name != RUN;
     for (k, v) in t {
         let kp = format!("{path}.{k}");
         match k.as_str() {
@@ -179,6 +206,21 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
                 cwd = Some(Template::parse(s, &kp)?);
             }
             "env" => env = parse_env(v, &kp)?,
+            "ready" if service => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("`{kp}` must be a regex string"))?;
+                ready = Some(Regex::new(s).map_err(|e| format!("`{kp}`: {e}"))?);
+            }
+            "wait" if service => {
+                let err = || format!("`{kp}` must be an array of service names");
+                wait = v
+                    .as_array()
+                    .ok_or_else(err)?
+                    .iter()
+                    .map(|x| x.as_str().map(str::to_string).ok_or_else(err))
+                    .collect::<Res<_>>()?;
+            }
             _ => return Err(format!("unknown key `{kp}`")),
         }
     }
@@ -187,6 +229,8 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
         cmd: cmd.ok_or_else(|| format!("`{path}.cmd` is required"))?,
         cwd,
         env,
+        ready,
+        wait,
     })
 }
 
@@ -303,6 +347,8 @@ impl Config {
             cmd,
             cwd,
             env,
+            ready: s.ready.clone(),
+            wait: s.wait.clone(),
         })
     }
 }
@@ -440,6 +486,56 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
         assert_eq!(
             e("[services.run]\ncmd = \"x\""),
             "service name `run` is reserved for `[[run]]` steps"
+        );
+    }
+
+    #[test]
+    fn ready_and_wait() {
+        let cfg = parse(
+            "[services.db]\ncmd = \"x\"\nready = \"listening on \\\\d+\"\n\n[services.api]\ncmd = \"x\"\nwait = [\"db\"]\n",
+            PathBuf::from("/r"),
+        )
+        .unwrap();
+        let svcs = cfg
+            .render(&BTreeMap::new(), Path::new("/r/.ads"), &[])
+            .unwrap();
+        assert_eq!(svcs[0].name, "api");
+        assert_eq!(svcs[0].wait, ["db"]);
+        assert!(
+            svcs[1]
+                .ready
+                .as_ref()
+                .unwrap()
+                .is_match(b"listening on 5432")
+        );
+
+        let e = |s: &str| parse(s, PathBuf::from("/r")).err().unwrap();
+        assert_eq!(
+            e(
+                "[services.api]\ncmd = \"x\"\nwait = [\"db\"]\n[services.db]\ncmd = \"x\"\nready = \"x\""
+            ),
+            "`services.api.wait`: `db` must be defined above `api`"
+        );
+        assert_eq!(
+            e("[services.a]\ncmd = \"x\"\nwait = [\"a\"]\nready = \"x\""),
+            "`services.a.wait`: `a` must be defined above `a`"
+        );
+        assert_eq!(
+            e("[services.db]\ncmd = \"x\"\n[services.api]\ncmd = \"x\"\nwait = [\"db\"]"),
+            "`services.api.wait`: `db` has no `ready` pattern"
+        );
+        assert_eq!(
+            e("[services.api]\ncmd = \"x\"\nwait = [\"nope\"]"),
+            "`services.api.wait`: unknown service `nope`"
+        );
+        assert_eq!(
+            e("[services.api]\ncmd = \"x\"\nwait = \"db\""),
+            "`services.api.wait` must be an array of service names"
+        );
+        assert!(e("[services.a]\ncmd = \"x\"\nready = \"(\"").starts_with("`services.a.ready`: "));
+        assert_eq!(
+            e("[[run]]\ncmd = \"x\"\nready = \"x\"\n[services.a]\ncmd = \"x\""),
+            "unknown key `run[0].ready`"
         );
     }
 }
