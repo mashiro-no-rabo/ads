@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    hash::{BuildHasher, RandomState},
     ops::RangeInclusive,
 };
 
@@ -11,13 +12,18 @@ pub fn env_name(port: &str) -> String {
     format!("ADS_PORT_{}", port.to_ascii_uppercase().replace('-', "_"))
 }
 
+/// Starts at a random offset so concurrent stacks don't race for the same ports: a port is only
+/// probed, not held, until its service binds it.
 pub fn allocate(names: &BTreeSet<String>) -> Res<BTreeMap<String, u16>> {
-    allocate_with(names, RANGE, sys::port_free)
+    let len = u64::from(RANGE.end() - RANGE.start()) + 1;
+    let offset = (RandomState::new().hash_one(std::process::id()) % len) as u16;
+    allocate_with(names, RANGE, offset, sys::port_free)
 }
 
 fn allocate_with(
     names: &BTreeSet<String>,
     range: RangeInclusive<u16>,
+    offset: u16,
     free: impl Fn(u16) -> bool,
 ) -> Res<BTreeMap<String, u16>> {
     let mut seen = BTreeMap::new();
@@ -29,20 +35,21 @@ fn allocate_with(
             ));
         }
     }
-    let mut next = u32::from(*range.start());
-    let end = u32::from(*range.end());
+    let start = u32::from(*range.start());
+    let len = u32::from(*range.end()) - start + 1;
+    let mut tried = 0;
     let mut out = BTreeMap::new();
     for n in names {
         loop {
-            if next > end {
+            if tried == len {
                 return Err(format!(
                     "no free port for `{n}` in {}-{}",
                     range.start(),
                     range.end()
                 ));
             }
-            let p = next as u16;
-            next += 1;
+            let p = (start + (u32::from(offset) + tried) % len) as u16;
+            tried += 1;
             if free(p) {
                 out.insert(n.clone(), p);
                 break;
@@ -62,7 +69,8 @@ mod tests {
 
     #[test]
     fn sorted_sequential_skipping_busy() {
-        let got = allocate_with(&names(&["web", "api", "db"]), 8000..=8010, |p| p != 8001).unwrap();
+        let got =
+            allocate_with(&names(&["web", "api", "db"]), 8000..=8010, 0, |p| p != 8001).unwrap();
         assert_eq!(
             got,
             BTreeMap::from([
@@ -74,14 +82,29 @@ mod tests {
     }
 
     #[test]
+    fn offset_wraps_around() {
+        let got = allocate_with(&names(&["a", "b", "c"]), 8000..=8009, 8, |p| p != 8009).unwrap();
+        assert_eq!(
+            got,
+            BTreeMap::from([
+                ("a".to_string(), 8008),
+                ("b".to_string(), 8000),
+                ("c".to_string(), 8001)
+            ])
+        );
+        let e = allocate_with(&names(&["a", "b"]), 8000..=8001, 1, |p| p != 8001).unwrap_err();
+        assert_eq!(e, "no free port for `b` in 8000-8001");
+    }
+
+    #[test]
     fn exhausted() {
-        let e = allocate_with(&names(&["a", "b"]), 8000..=8001, |p| p != 8001).unwrap_err();
+        let e = allocate_with(&names(&["a", "b"]), 8000..=8001, 0, |p| p != 8001).unwrap_err();
         assert_eq!(e, "no free port for `b` in 8000-8001");
     }
 
     #[test]
     fn env_name_collision() {
-        let e = allocate_with(&names(&["a-b", "a_b"]), RANGE, |_| true).unwrap_err();
+        let e = allocate_with(&names(&["a-b", "a_b"]), RANGE, 0, |_| true).unwrap_err();
         assert!(e.contains("ADS_PORT_A_B"));
     }
 }
