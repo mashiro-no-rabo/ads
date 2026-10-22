@@ -27,6 +27,7 @@ pub const RUN: &str = "run";
 pub struct ServiceSpec {
     pub name: String,
     cmd: CmdSpec,
+    flag: Option<String>,
     cond: Option<CmdSpec>,
     cwd: Option<Template>,
     env: Vec<(String, Template)>,
@@ -42,6 +43,7 @@ enum CmdSpec {
 pub struct Service {
     pub name: String,
     pub cmd: Cmd,
+    pub flag: Option<String>,
     pub cond: Option<Cmd>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
@@ -171,6 +173,7 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
         .as_table()
         .ok_or_else(|| format!("`{path}` must be a table"))?;
     let mut cmd = None;
+    let mut flag = None;
     let mut cond = None;
     let mut cwd = None;
     let mut env = Vec::new();
@@ -181,7 +184,16 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
         let kp = format!("{path}.{k}");
         match k.as_str() {
             "cmd" => cmd = Some(parse_cmd(v, &kp)?),
-            "if" if service => cond = Some(parse_cmd(v, &kp)?),
+            "if" => {
+                let s = v
+                    .as_str()
+                    .filter(|s| template::valid_name(s))
+                    .ok_or_else(|| {
+                        format!("`{kp}` must be an option name (letters, digits, `_`, `-`)")
+                    })?;
+                flag = Some(s.to_string());
+            }
+            "if_cmd" => cond = Some(parse_cmd(v, &kp)?),
             "cwd" => {
                 let s = v
                     .as_str()
@@ -210,6 +222,7 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
     Ok(ServiceSpec {
         name: name.to_string(),
         cmd: cmd.ok_or_else(|| format!("`{path}.cmd` is required"))?,
+        flag,
         cond,
         cwd,
         env,
@@ -282,6 +295,14 @@ impl ServiceSpec {
 }
 
 impl Config {
+    pub fn options(&self) -> BTreeSet<&str> {
+        self.run
+            .iter()
+            .chain(&self.services)
+            .filter_map(|s| s.flag.as_deref())
+            .collect()
+    }
+
     pub fn port_names(&self) -> BTreeSet<String> {
         self.env
             .iter()
@@ -362,6 +383,7 @@ impl Config {
         Ok(Service {
             name: s.name.clone(),
             cmd,
+            flag: s.flag.clone(),
             cond,
             cwd,
             env,
@@ -560,7 +582,7 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
     #[test]
     fn cond() {
         let cfg = parse(
-            "[services.a]\ncmd = \"x\"\nif = [\"test\", \"{{ports.a}}\"]\n",
+            "[[run]]\ncmd = \"x\"\nif = \"reset\"\n[services.a]\ncmd = \"x\"\nif = \"seed\"\nif_cmd = [\"test\", \"{{ports.a}}\"]\n",
             PathBuf::from("/r"),
         )
         .unwrap();
@@ -568,15 +590,20 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
         let ports = BTreeMap::from([("a".to_string(), 8000)]);
         let svcs = cfg.render(&ports, Path::new("/r/.ads"), &[]).unwrap();
         assert!(matches!(&svcs[0].cond, Some(Cmd::Argv(a)) if a == &["test", "8000"]));
+        assert_eq!(svcs[0].flag.as_deref(), Some("seed"));
+        assert_eq!(
+            cfg.options().into_iter().collect::<Vec<_>>(),
+            ["reset", "seed"]
+        );
 
         let e = |s: &str| parse(s, PathBuf::from("/r")).err().unwrap();
         assert_eq!(
-            e("[services.a]\ncmd = \"x\"\nif = []"),
-            "`services.a.if` must be a string or a non-empty array of strings"
+            e("[services.a]\ncmd = \"x\"\nif_cmd = []"),
+            "`services.a.if_cmd` must be a string or a non-empty array of strings"
         );
         assert_eq!(
-            e("[[run]]\ncmd = \"x\"\nif = \"x\"\n[services.a]\ncmd = \"x\""),
-            "unknown key `run[0].if`"
+            e("[services.a]\ncmd = \"x\"\nif = \"+a b\""),
+            "`services.a.if` must be an option name (letters, digits, `_`, `-`)"
         );
     }
 }

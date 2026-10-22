@@ -17,8 +17,8 @@ cmd = "postgres -p {{ports.db}}"
 ready = "ready to accept connections"
 
 [services.api]
-cmd = "run --db-port {{ports.db}}"
 wait = ["db"]
+cmd = "run --db-port {{ports.db}}"
 ```
 
 `ready` is a regex matched against each stdout/stderr line. The first match marks
@@ -31,17 +31,28 @@ earlier in `ads.toml` and have a `ready` pattern. Waiting services show as
 ## Conditional services
 
 ```toml
+[[run]]
+if = "reset"
+cmd = "reset-db"
+
 [services.worker]
+if_cmd = "test -f .env.worker"
 cmd = "run-worker"
-if = "test -f .env.worker"
 ```
 
-`if` runs before each service start, after any `wait`. Exit code 0 starts the
-service; otherwise, `ads ps` shows `skipped` with the exit reason. Use `ads start`
-to re-evaluate a skipped service. Skipped services satisfy dependents' `wait`.
+`if` names an option turned on by a `+name` argument: `ads +reset` or
+`ads up -d +reset`. Options are fixed for the stack's lifetime. Passing an option
+no `if` uses is an error. `ads check +reset` previews which options are on.
 
-Like `cmd`, `if` accepts a shell string or an argv array, supports templates,
+`if_cmd` runs before each service start, after any `wait`. Exit code 0 starts the
+service. Like `cmd`, it accepts a shell string or an argv array, supports templates,
 and uses the service's `cwd` and `env`. Its output goes to the service log.
+
+When both are set, the service starts only if the option is on and `if_cmd`
+succeeds. Otherwise, `ads ps` shows `skipped` with the reason. Use `ads start` to
+re-evaluate a skipped service. Skipped services satisfy dependents' `wait`.
+
+`[[run]]` steps support both the same way. A skipped step doesn't stop the stack.
 
 ## Opening URLs and ports
 

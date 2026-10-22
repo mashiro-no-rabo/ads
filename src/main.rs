@@ -23,13 +23,15 @@ ads - agent dev stack
 usage: ads [-c ads.toml] [command]
 
 With no command, start services if ads.toml is found; otherwise show this help.
+`+name` arguments to `up`, `check` or no command turn on options checked by `if`.
 
 options:
   -h, --help              show this help
   -V, --version           show the version
 
 commands:
-  up [-d] [svc...]        start services in the foreground (Ctrl-C to stop), -d to detach
+  up [-d] [svc...] [+opt...]
+                          start services in the foreground (Ctrl-C to stop), -d to detach
   down                    stop the running daemon
   start|stop|restart <svc...>
                           control services of the running daemon
@@ -39,7 +41,7 @@ commands:
   open [name] | --all      open a configured URL or port (defaults to the first entry)
   logs [svc...] [-f] [-n N]
                           show the last N (100) log lines, -f to follow
-  check                   validate the config and show rendered services
+  check [+opt...]         validate the config and show rendered services
 ";
 
 fn main() -> ExitCode {
@@ -81,11 +83,11 @@ fn run() -> Res<()> {
         Some("up") => {
             let detach = args.contains(["-d", "--detach"]);
             let detached_child = args.contains("--detached-child");
-            let only = free(args)?;
+            let (only, options) = options(free(args)?)?;
             let config = config::find(explicit)?;
             match detach {
-                true => supervisor::detach(&config, &only),
-                false => supervisor::up(&config, &only, detached_child),
+                true => supervisor::detach(&config, &only, &options),
+                false => supervisor::up(&config, &only, &options, detached_child),
             }
         }
         Some(cmd @ ("start" | "stop" | "restart")) => {
@@ -133,14 +135,20 @@ fn run() -> Res<()> {
             logs::cmd(&state()?, &services, n.unwrap_or(100), follow)
         }
         Some("check") => {
-            free_none(args)?;
-            supervisor::check(&config::find(explicit)?)
+            let options = options_only(free(args)?)?;
+            supervisor::check(&config::find(explicit)?, &options)
+        }
+        Some(o) if o.starts_with('+') => {
+            let mut rest = vec![o.to_string()];
+            rest.extend(free(args)?);
+            let options = options_only(rest)?;
+            supervisor::up(&config::find(explicit)?, &[], &options, false)
         }
         Some(other) => Err(format!("unknown command `{other}`, see `ads --help`")),
         None => {
             free_none(args)?;
             match config::find(explicit) {
-                Ok(config) => supervisor::up(&config, &[], false),
+                Ok(config) => supervisor::up(&config, &[], &[], false),
                 Err(_) => {
                     print!("{USAGE}");
                     Ok(())
@@ -159,6 +167,29 @@ fn free(args: pico_args::Arguments) -> Res<Vec<String>> {
             Err(a) => Err(format!("invalid argument {a:?}")),
         })
         .collect()
+}
+
+/// Splits `+name` options from the other free arguments.
+fn options(args: Vec<String>) -> Res<(Vec<String>, Vec<String>)> {
+    let (opts, rest): (Vec<_>, Vec<_>) = args.into_iter().partition(|a| a.starts_with('+'));
+    let opts = opts
+        .into_iter()
+        .map(|o| match &o[1..] {
+            n if template::valid_name(n) => Ok(n.to_string()),
+            _ => Err(format!(
+                "invalid option `{o}` (use letters, digits, `_`, `-`)"
+            )),
+        })
+        .collect::<Res<_>>()?;
+    Ok((rest, opts))
+}
+
+fn options_only(args: Vec<String>) -> Res<Vec<String>> {
+    let (rest, opts) = options(args)?;
+    match rest.first() {
+        Some(a) => Err(format!("unexpected argument `{a}`")),
+        None => Ok(opts),
+    }
 }
 
 fn free_none(args: pico_args::Arguments) -> Res<()> {

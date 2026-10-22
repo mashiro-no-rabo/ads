@@ -172,10 +172,14 @@ impl std::ops::DerefMut for Daemon {
 }
 
 fn up(dir: &Path) -> Daemon {
+    up_with(dir, &["up"])
+}
+
+fn up_with(dir: &Path, args: &[&str]) -> Daemon {
     let out = || fs::File::create(dir.join("up.out")).unwrap();
     Daemon(
         Command::new(env!("CARGO_BIN_EXE_ads"))
-            .arg("up")
+            .args(args)
             .current_dir(dir)
             .stdout(out())
             .stderr(Stdio::null())
@@ -444,8 +448,8 @@ fn ports_env_and_templates() {
         "ports",
         r#"
 [services.web]
-cmd = "echo \"$ADS_PORT_WEB {{ports.web}} $FOO\" > {{state}}/out; sleep 1000"
 env = { FOO = "http://127.0.0.1:{{ports.web}}" }
+cmd = "echo \"$ADS_PORT_WEB {{ports.web}} $FOO\" > {{state}}/out; sleep 1000"
 "#,
     );
     let mut d = up(&dir);
@@ -721,8 +725,8 @@ cmd = "sleep 0.5; echo 'listening on 1'; echo 'listening on 2'; sleep 1000"
 ready = "^listening on \\d+$"
 
 [services.api]
-cmd = "sleep 1000"
 wait = ["db"]
+cmd = "sleep 1000"
 "#,
     );
     let mut d = up(&dir);
@@ -771,26 +775,26 @@ fn if_condition() {
         "if",
         r#"
 [services.db]
+if_cmd = "test -f enable-db"
 cmd = "echo up; sleep 1000"
-if = "test -f enable-db"
 ready = "^up$"
 
 [services.api]
-cmd = "sleep 1000"
-if = ["true"]
 wait = ["db"]
+if_cmd = ["true"]
+cmd = "sleep 1000"
 "#,
     );
     let mut d = up(&dir);
     // A skipped dependency counts as satisfied.
     running_groups(&dir, 1);
     assert_eq!(pid_of(&dir, "db").1, "skipped");
-    assert_eq!(status(&dir)[1].3, "if: code 1");
+    assert_eq!(status(&dir)[1].3, "if_cmd: code 1");
 
     let out = ads(&dir, &["start", "db"]);
     assert_eq!(
         String::from_utf8_lossy(&out.stdout),
-        "db skipped (if: code 1)\n"
+        "db skipped (if_cmd: code 1)\n"
     );
     fs::write(dir.join("enable-db"), "").unwrap();
     let out = ads(&dir, &["start", "db"]);
@@ -807,7 +811,7 @@ wait = ["db"]
 fn hanging_if_stops_on_shutdown() {
     let dir = setup(
         "if-hang",
-        "[services.a]\ncmd = 'sleep 1000'\nif = 'sleep 1000'\n",
+        "[services.a]\nif_cmd = 'sleep 1000'\ncmd = 'sleep 1000'\n",
     );
     let mut d = up(&dir);
     assert!(wait_for(Duration::from_secs(3), || {
@@ -817,4 +821,62 @@ fn hanging_if_stops_on_shutdown() {
     assert!(ads(&dir, &["down"]).status.success());
     assert!(wait_exit(&mut d, Duration::from_secs(2)));
     assert!(!group_alive(pid));
+}
+
+#[test]
+fn if_option() {
+    let config = r#"
+[[run]]
+if = "reset"
+cmd = "touch reset-ran"
+
+[[run]]
+if = "reset"
+if_cmd = "false"
+cmd = "touch never-ran"
+
+[[run]]
+if = "reset"
+if_cmd = "test -f reset-ran"
+cmd = "touch both-ran"
+
+[services.a]
+if = "reset"
+if_cmd = "test -f enable-a"
+cmd = "sleep 1000"
+
+[services.b]
+if = "reset"
+cmd = "sleep 1000"
+"#;
+    let dir = setup("if-option", config);
+    let out = ads(&dir, &["up", "+nope"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "ads: unknown option `+nope`, not used by any `if`\n"
+    );
+    let out = ads(&dir, &["check", "+reset"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("if: +reset (on)"),
+        "{out:?}"
+    );
+
+    let mut d = up(&dir);
+    assert!(wait_for(Duration::from_secs(3), || status(&dir).len() == 2
+        && status(&dir).iter().all(|r| r.2 == "skipped")));
+    assert_eq!(status(&dir)[0].3, "if: +reset not set");
+    assert!(!dir.join("reset-ran").exists());
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+
+    let mut d = up_with(&dir, &["+reset"]);
+    running_groups(&dir, 1);
+    assert!(dir.join("reset-ran").exists());
+    assert!(!dir.join("never-ran").exists());
+    assert!(dir.join("both-ran").exists());
+    assert_eq!(pid_of(&dir, "a").1, "skipped");
+    assert_eq!(status(&dir)[0].3, "if_cmd: code 1");
+    assert_eq!(pid_of(&dir, "b").1, "running");
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
 }

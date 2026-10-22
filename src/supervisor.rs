@@ -104,17 +104,19 @@ struct Supervisor {
     procs: Vec<Proc>,
     groups: BTreeSet<i32>,
     lifeline: Lifeline,
+    options: BTreeSet<String>,
     shutting: bool,
     forced: bool,
 }
 
-pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
+pub fn up(config_path: &Path, only: &[String], options: &[String], detached: bool) -> Res<()> {
     let cfg = config::load(config_path)?;
     for name in only {
         if !cfg.services.iter().any(|s| &s.name == name) {
             return Err(format!("unknown service `{name}`"));
         }
     }
+    let options = check_options(&cfg, options)?;
     let state = State::new(&cfg.root);
     state.init()?;
     let _lock = state.lock()?;
@@ -171,6 +173,7 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
     };
     if let Err(e) = run_steps(
         &steps,
+        &options,
         &state,
         &daemon,
         &run_prefix,
@@ -229,6 +232,7 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
         procs,
         groups: BTreeSet::new(),
         lifeline,
+        options,
         shutting: false,
         forced: false,
     };
@@ -244,6 +248,7 @@ pub fn up(config_path: &Path, only: &[String], detached: bool) -> Res<()> {
 #[allow(clippy::too_many_arguments)]
 fn run_steps(
     steps: &[Service],
+    options: &BTreeSet<String>,
     state: &State,
     daemon: &Daemon,
     prefix: &str,
@@ -252,20 +257,9 @@ fn run_steps(
     rx: &mpsc::Receiver<Event>,
     lifeline: &mut Lifeline,
 ) -> Res<()> {
-    for (i, step) in steps.iter().enumerate() {
-        let label = format!("run[{i}]");
-        daemon.say(&format!("{label}: {}", step.cmd.display()));
-        let pid = spawn(
-            state,
-            step,
-            &step.cmd,
-            prefix,
-            echo,
-            None,
-            tx,
-            Event::StepExited,
-        )
-        .map_err(|e| format!("{label} failed to start: {e}"))?;
+    let mut exec = |step: &Service, cmd: &Cmd, label: &str| -> Res<io::Result<ExitStatus>> {
+        let pid = spawn(state, step, cmd, prefix, echo, None, tx, Event::StepExited)
+            .map_err(|e| format!("{label} failed to start: {e}"))?;
         lifeline.add(pid);
         let mut interrupted = false;
         let status = loop {
@@ -286,8 +280,31 @@ fn run_steps(
         // Steps must finish; anything they left running in the background goes too.
         sys::terminate_groups(&[pid], GRACE);
         lifeline.remove(pid);
-        match status {
-            _ if interrupted => return Err(format!("{label} interrupted")),
+        match interrupted {
+            true => Err(format!("{label} interrupted")),
+            false => Ok(status),
+        }
+    };
+    for (i, step) in steps.iter().enumerate() {
+        let label = format!("run[{i}]");
+        if let Some(f) = step.flag.as_ref().filter(|f| !options.contains(*f)) {
+            daemon.say(&format!("{label} skipped (if: +{f} not set)"));
+            continue;
+        }
+        if let Some(cond) = &step.cond {
+            daemon.say(&format!("checking {label}: {}", cond.display()));
+            let why = match exec(step, cond, &format!("{label} if_cmd"))? {
+                Ok(s) if s.success() => None,
+                Ok(s) => Some(describe(s)),
+                Err(e) => Some(format!("wait failed: {e}")),
+            };
+            if let Some(why) = why {
+                daemon.say(&format!("{label} skipped (if_cmd: {why})"));
+                continue;
+            }
+        }
+        daemon.say(&format!("{label}: {}", step.cmd.display()));
+        match exec(step, &step.cmd, &label)? {
             Ok(s) if s.success() => daemon.say(&format!("{label} done")),
             Ok(s) => return Err(format!("{label} failed ({})", describe(s))),
             Err(e) => return Err(format!("{label}: wait failed: {e}")),
@@ -383,13 +400,7 @@ impl Supervisor {
                         };
                         match why {
                             None => self.start(idx, echo),
-                            Some(why) => {
-                                self.daemon
-                                    .say(&format!("{} skipped (if: {why})", p.svc.name));
-                                p.phase = Phase::Skipped;
-                                p.exit = Some(format!("if: {why}"));
-                                self.wake(echo);
-                            }
+                            Some(why) => self.skip(idx, format!("if_cmd: {why}"), echo),
                         }
                         self.answer(idx);
                     }
@@ -420,10 +431,22 @@ impl Supervisor {
                 .daemon
                 .say(&format!("{} waiting for {unmet}", p.svc.name));
         }
-        match self.procs[idx].svc.cond {
+        let svc = &self.procs[idx].svc;
+        if let Some(f) = svc.flag.as_ref().filter(|f| !self.options.contains(*f)) {
+            return self.skip(idx, format!("if: +{f} not set"), echo);
+        }
+        match svc.cond {
             Some(_) => self.check(idx, echo),
             None => self.start(idx, echo),
         }
+    }
+
+    fn skip(&mut self, idx: usize, why: String, echo: bool) {
+        let p = &mut self.procs[idx];
+        self.daemon.say(&format!("{} skipped ({why})", p.svc.name));
+        p.phase = Phase::Skipped;
+        p.exit = Some(why);
+        self.wake(echo);
     }
 
     /// Top-to-bottom pass; enough because `wait` only points upwards.
@@ -437,7 +460,7 @@ impl Supervisor {
 
     fn check(&mut self, idx: usize, echo: bool) {
         let p = &mut self.procs[idx];
-        let cond = p.svc.cond.as_ref().expect("checked service has `if`");
+        let cond = p.svc.cond.as_ref().expect("checked service has `if_cmd`");
         match spawn(
             &self.state,
             &p.svc,
@@ -462,7 +485,7 @@ impl Supervisor {
             }
             Err(e) => {
                 p.phase = Phase::Failed;
-                p.exit = Some(format!("if: spawn: {e}"));
+                p.exit = Some(format!("if_cmd: spawn: {e}"));
                 self.daemon
                     .say(&format!("failed to check {}: {e}", p.svc.name));
             }
@@ -539,7 +562,7 @@ impl Supervisor {
         self.answer(idx);
     }
 
-    /// Replies are held while `if` runs; `Checked` answers them.
+    /// Replies are held while `if_cmd` runs; `Checked` answers them.
     fn answer(&mut self, idx: usize) {
         if self.procs[idx].phase == Phase::Checking {
             return;
@@ -725,7 +748,7 @@ fn write_ports(state: &State, ports: &BTreeMap<String, u16>) -> io::Result<()> {
 
 const STATUS_HEADER: &str = "name\tpid\tstate\tstarted\texit";
 
-pub fn detach(config_path: &Path, only: &[String]) -> Res<()> {
+pub fn detach(config_path: &Path, only: &[String], options: &[String]) -> Res<()> {
     let state = State::new(&config::root_of(config_path));
     state.init()?;
     if let Some(pid) = state.daemon_pid() {
@@ -742,6 +765,7 @@ pub fn detach(config_path: &Path, only: &[String]) -> Res<()> {
         .arg("up")
         .arg("--detached-child")
         .args(only)
+        .args(options.iter().map(|o| format!("+{o}")))
         .stdin(Stdio::null())
         .stdout(out.try_clone().map_err(|e| e.to_string())?)
         .stderr(out);
@@ -869,8 +893,19 @@ fn align(tsv: &str) -> String {
     out
 }
 
-pub fn check(config_path: &Path) -> Res<()> {
+fn check_options(cfg: &config::Config, options: &[String]) -> Res<BTreeSet<String>> {
+    let known = cfg.options();
+    for o in options {
+        if !known.contains(o.as_str()) {
+            return Err(format!("unknown option `+{o}`, not used by any `if`"));
+        }
+    }
+    Ok(options.iter().cloned().collect())
+}
+
+pub fn check(config_path: &Path, options: &[String]) -> Res<()> {
     let cfg = config::load(config_path)?;
+    let options = check_options(&cfg, options)?;
     let state = State::new(&cfg.root);
     let ports = ports::allocate(&cfg.port_names())?;
     let services = cfg.render(&ports, &state.dir, &[])?;
@@ -892,6 +927,12 @@ pub fn check(config_path: &Path) -> Res<()> {
         println!("run:");
         for (i, s) in steps.iter().enumerate() {
             println!("  [{i}] {}", s.cmd.display());
+            if let Some(f) = &s.flag {
+                println!("      if: +{f} ({})", on_off(&options, f));
+            }
+            if let Some(c) = &s.cond {
+                println!("      if_cmd: {}", c.display());
+            }
             if s.cwd != cfg.root {
                 println!("      cwd: {}", s.cwd.display());
             }
@@ -901,8 +942,11 @@ pub fn check(config_path: &Path) -> Res<()> {
     for s in &services {
         println!("  {}:", s.name);
         println!("    cmd: {}", s.cmd.display());
+        if let Some(f) = &s.flag {
+            println!("    if: +{f} ({})", on_off(&options, f));
+        }
         if let Some(c) = &s.cond {
-            println!("    if: {}", c.display());
+            println!("    if_cmd: {}", c.display());
         }
         println!("    cwd: {}", s.cwd.display());
         if let Some(re) = &s.ready {
@@ -922,4 +966,11 @@ pub fn check(config_path: &Path) -> Res<()> {
         }
     }
     Ok(())
+}
+
+fn on_off(options: &BTreeSet<String>, f: &str) -> &'static str {
+    match options.contains(f) {
+        true => "on",
+        false => "off",
+    }
 }
