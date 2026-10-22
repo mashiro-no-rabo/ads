@@ -29,6 +29,10 @@ enum Event {
     StepExited(io::Result<ExitStatus>),
     GroupGone(i32),
     Ready(usize),
+    Checked {
+        idx: usize,
+        status: io::Result<ExitStatus>,
+    },
     Control {
         line: String,
         reply: mpsc::Sender<String>,
@@ -38,6 +42,8 @@ enum Event {
 #[derive(Clone, Copy, PartialEq)]
 enum Phase {
     Waiting,
+    Checking,
+    Skipped,
     Running,
     Stopping,
     Exited,
@@ -48,6 +54,8 @@ impl Phase {
     fn as_str(self) -> &'static str {
         match self {
             Phase::Waiting => "waiting",
+            Phase::Checking => "checking",
+            Phase::Skipped => "skipped",
             Phase::Running => "running",
             Phase::Stopping => "stopping",
             Phase::Exited => "exited",
@@ -247,8 +255,17 @@ fn run_steps(
     for (i, step) in steps.iter().enumerate() {
         let label = format!("run[{i}]");
         daemon.say(&format!("{label}: {}", step.cmd.display()));
-        let pid = spawn(state, step, prefix, echo, None, tx, Event::StepExited)
-            .map_err(|e| format!("{label} failed to start: {e}"))?;
+        let pid = spawn(
+            state,
+            step,
+            &step.cmd,
+            prefix,
+            echo,
+            None,
+            tx,
+            Event::StepExited,
+        )
+        .map_err(|e| format!("{label} failed to start: {e}"))?;
         lifeline.add(pid);
         let mut interrupted = false;
         let status = loop {
@@ -285,7 +302,7 @@ impl Supervisor {
             let busy = self
                 .procs
                 .iter()
-                .any(|p| matches!(p.phase, Phase::Running | Phase::Stopping));
+                .any(|p| matches!(p.phase, Phase::Checking | Phase::Running | Phase::Stopping));
             if self.shutting && !busy && self.groups.is_empty() {
                 break;
             }
@@ -349,11 +366,32 @@ impl Supervisor {
                         self.procs[idx].ready = true;
                         self.daemon
                             .say(&format!("{} ready", self.procs[idx].svc.name));
-                        for i in 0..self.procs.len() {
-                            if self.procs[i].phase == Phase::Waiting && self.unmet(i).is_empty() {
-                                self.start(i, echo);
+                        self.wake(echo);
+                    }
+                }
+                Event::Checked { idx, status } => {
+                    let p = &mut self.procs[idx];
+                    if p.phase == Phase::Stopping {
+                        p.phase = Phase::Exited;
+                        self.settle(idx, echo);
+                    } else {
+                        stop_group(p.pid.unwrap(), &self.tx);
+                        let why = match status {
+                            Ok(s) if s.success() => None,
+                            Ok(s) => Some(describe(s)),
+                            Err(e) => Some(format!("wait failed: {e}")),
+                        };
+                        match why {
+                            None => self.start(idx, echo),
+                            Some(why) => {
+                                self.daemon
+                                    .say(&format!("{} skipped (if: {why})", p.svc.name));
+                                p.phase = Phase::Skipped;
+                                p.exit = Some(format!("if: {why}"));
+                                self.wake(echo);
                             }
                         }
+                        self.answer(idx);
                     }
                 }
                 Event::Control { line, reply } => self.control(&line, reply, echo),
@@ -368,20 +406,67 @@ impl Supervisor {
         self.procs[idx]
             .wait
             .iter()
-            .filter(|&&w| !self.procs[w].ready)
+            .filter(|&&w| !self.procs[w].ready && self.procs[w].phase != Phase::Skipped)
             .map(|&w| self.procs[w].svc.name.as_str())
             .collect()
     }
 
     fn launch(&mut self, idx: usize, echo: bool) {
         let unmet = self.unmet(idx).join(", ");
-        if unmet.is_empty() {
-            return self.start(idx, echo);
+        if !unmet.is_empty() {
+            let p = &mut self.procs[idx];
+            p.phase = Phase::Waiting;
+            return self
+                .daemon
+                .say(&format!("{} waiting for {unmet}", p.svc.name));
         }
+        match self.procs[idx].svc.cond {
+            Some(_) => self.check(idx, echo),
+            None => self.start(idx, echo),
+        }
+    }
+
+    /// Top-to-bottom pass; enough because `wait` only points upwards.
+    fn wake(&mut self, echo: bool) {
+        for i in 0..self.procs.len() {
+            if self.procs[i].phase == Phase::Waiting && self.unmet(i).is_empty() {
+                self.launch(i, echo);
+            }
+        }
+    }
+
+    fn check(&mut self, idx: usize, echo: bool) {
         let p = &mut self.procs[idx];
-        p.phase = Phase::Waiting;
-        self.daemon
-            .say(&format!("{} waiting for {unmet}", p.svc.name));
+        let cond = p.svc.cond.as_ref().expect("checked service has `if`");
+        match spawn(
+            &self.state,
+            &p.svc,
+            cond,
+            &p.prefix,
+            echo,
+            None,
+            &self.tx,
+            move |status| Event::Checked { idx, status },
+        ) {
+            Ok(pid) => {
+                self.lifeline.add(pid);
+                self.groups.insert(pid);
+                p.pid = Some(pid);
+                p.phase = Phase::Checking;
+                p.exit = None;
+                self.daemon.say(&format!(
+                    "checking {} (pid {pid}): {}",
+                    p.svc.name,
+                    cond.display()
+                ));
+            }
+            Err(e) => {
+                p.phase = Phase::Failed;
+                p.exit = Some(format!("if: spawn: {e}"));
+                self.daemon
+                    .say(&format!("failed to check {}: {e}", p.svc.name));
+            }
+        }
     }
 
     fn start(&mut self, idx: usize, echo: bool) {
@@ -398,6 +483,7 @@ impl Supervisor {
         match spawn(
             &self.state,
             &p.svc,
+            &p.svc.cmd,
             &p.prefix,
             echo,
             watch,
@@ -429,7 +515,7 @@ impl Supervisor {
     fn stop(&mut self, idx: usize) {
         let p = &mut self.procs[idx];
         match p.phase {
-            Phase::Running => {
+            Phase::Running | Phase::Checking => {
                 p.phase = Phase::Stopping;
                 stop_group(p.pid.unwrap(), &self.tx);
             }
@@ -441,7 +527,7 @@ impl Supervisor {
     /// Acts once the service and every member of its group are gone.
     fn settle(&mut self, idx: usize, echo: bool) {
         let p = &self.procs[idx];
-        let gone = matches!(p.phase, Phase::Exited | Phase::Failed)
+        let gone = matches!(p.phase, Phase::Exited | Phase::Failed | Phase::Skipped)
             && p.pid.is_none_or(|g| !self.groups.contains(&g));
         if !gone {
             return;
@@ -450,11 +536,24 @@ impl Supervisor {
             self.procs[idx].pending_start = false;
             self.launch(idx, echo);
         }
+        self.answer(idx);
+    }
+
+    /// Replies are held while `if` runs; `Checked` answers them.
+    fn answer(&mut self, idx: usize) {
+        if self.procs[idx].phase == Phase::Checking {
+            return;
+        }
         let unmet = self.unmet(idx).join(", ");
         let p = &mut self.procs[idx];
         let reply = match p.phase {
             Phase::Running => format!("ok {} running (pid {})", p.svc.name, p.pid.unwrap()),
             Phase::Waiting => format!("ok {} waiting for {unmet}", p.svc.name),
+            Phase::Skipped => format!(
+                "ok {} skipped ({})",
+                p.svc.name,
+                p.exit.as_deref().unwrap_or("")
+            ),
             Phase::Failed => format!(
                 "err {} failed to start: {}",
                 p.svc.name,
@@ -483,6 +582,9 @@ impl Supervisor {
         if self.procs[idx].phase == Phase::Waiting && matches!(cmd, "start" | "restart") {
             let unmet = self.unmet(idx).join(", ");
             return send(format!("ok {name} waiting for {unmet}"));
+        }
+        if self.procs[idx].phase == Phase::Checking && matches!(cmd, "start" | "restart") {
+            return self.procs[idx].waiters.push(reply);
         }
         match cmd {
             "stop" => {
@@ -527,16 +629,18 @@ impl Supervisor {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn(
     state: &State,
     svc: &Service,
+    cmd: &Cmd,
     prefix: &str,
     echo: bool,
     watch: Option<Arc<logs::Watch>>,
     tx: &mpsc::Sender<Event>,
     on_exit: impl FnOnce(io::Result<ExitStatus>) -> Event + Send + 'static,
 ) -> io::Result<i32> {
-    let mut cmd = match &svc.cmd {
+    let mut cmd = match cmd {
         Cmd::Shell(s) => {
             let mut c = Command::new("/bin/sh");
             c.arg("-c").arg(s);
@@ -797,6 +901,9 @@ pub fn check(config_path: &Path) -> Res<()> {
     for s in &services {
         println!("  {}:", s.name);
         println!("    cmd: {}", s.cmd.display());
+        if let Some(c) = &s.cond {
+            println!("    if: {}", c.display());
+        }
         println!("    cwd: {}", s.cwd.display());
         if let Some(re) = &s.ready {
             println!("    ready: {re}");

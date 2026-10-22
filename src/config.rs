@@ -27,6 +27,7 @@ pub const RUN: &str = "run";
 pub struct ServiceSpec {
     pub name: String,
     cmd: CmdSpec,
+    cond: Option<CmdSpec>,
     cwd: Option<Template>,
     env: Vec<(String, Template)>,
     ready: Option<Regex>,
@@ -41,6 +42,7 @@ enum CmdSpec {
 pub struct Service {
     pub name: String,
     pub cmd: Cmd,
+    pub cond: Option<Cmd>,
     pub cwd: PathBuf,
     pub env: Vec<(String, String)>,
     pub ready: Option<Regex>,
@@ -169,6 +171,7 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
         .as_table()
         .ok_or_else(|| format!("`{path}` must be a table"))?;
     let mut cmd = None;
+    let mut cond = None;
     let mut cwd = None;
     let mut env = Vec::new();
     let mut ready = None;
@@ -177,28 +180,8 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
     for (k, v) in t {
         let kp = format!("{path}.{k}");
         match k.as_str() {
-            "cmd" => {
-                cmd = Some(match v {
-                    Value::String(s) => CmdSpec::Shell(Template::parse(s, &kp)?),
-                    Value::Array(a) if !a.is_empty() => CmdSpec::Argv(
-                        a.iter()
-                            .enumerate()
-                            .map(|(i, x)| {
-                                let ip = format!("{kp}[{i}]");
-                                let s = x
-                                    .as_str()
-                                    .ok_or_else(|| format!("`{ip}` must be a string"))?;
-                                Template::parse(s, &ip)
-                            })
-                            .collect::<Res<_>>()?,
-                    ),
-                    _ => {
-                        return Err(format!(
-                            "`{kp}` must be a string or a non-empty array of strings"
-                        ));
-                    }
-                })
-            }
+            "cmd" => cmd = Some(parse_cmd(v, &kp)?),
+            "if" if service => cond = Some(parse_cmd(v, &kp)?),
             "cwd" => {
                 let s = v
                     .as_str()
@@ -227,10 +210,34 @@ fn parse_spec(name: &str, path: &str, v: &Value) -> Res<ServiceSpec> {
     Ok(ServiceSpec {
         name: name.to_string(),
         cmd: cmd.ok_or_else(|| format!("`{path}.cmd` is required"))?,
+        cond,
         cwd,
         env,
         ready,
         wait,
+    })
+}
+
+fn parse_cmd(v: &Value, kp: &str) -> Res<CmdSpec> {
+    Ok(match v {
+        Value::String(s) => CmdSpec::Shell(Template::parse(s, kp)?),
+        Value::Array(a) if !a.is_empty() => CmdSpec::Argv(
+            a.iter()
+                .enumerate()
+                .map(|(i, x)| {
+                    let ip = format!("{kp}[{i}]");
+                    let s = x
+                        .as_str()
+                        .ok_or_else(|| format!("`{ip}` must be a string"))?;
+                    Template::parse(s, &ip)
+                })
+                .collect::<Res<_>>()?,
+        ),
+        _ => {
+            return Err(format!(
+                "`{kp}` must be a string or a non-empty array of strings"
+            ));
+        }
     })
 }
 
@@ -260,10 +267,14 @@ fn parse_env(v: &Value, path: &str) -> Res<Vec<(String, Template)>> {
 
 impl ServiceSpec {
     fn templates(&self) -> impl Iterator<Item = &Template> {
-        let cmd: Vec<&Template> = match &self.cmd {
-            CmdSpec::Shell(t) => vec![t],
-            CmdSpec::Argv(a) => a.iter().collect(),
-        };
+        let cmd: Vec<&Template> = [&self.cmd]
+            .into_iter()
+            .chain(&self.cond)
+            .flat_map(|c| match c {
+                CmdSpec::Shell(t) => vec![t],
+                CmdSpec::Argv(a) => a.iter().collect(),
+            })
+            .collect();
         cmd.into_iter()
             .chain(&self.cwd)
             .chain(self.env.iter().map(|(_, t)| t))
@@ -334,10 +345,16 @@ impl Config {
         for (k, t) in self.env.iter().chain(&s.env) {
             env.push((k.clone(), t.render(&ctx)?));
         }
-        let cmd = match &s.cmd {
-            CmdSpec::Shell(t) => Cmd::Shell(t.render(&ctx)?),
-            CmdSpec::Argv(a) => Cmd::Argv(a.iter().map(|t| t.render(&ctx)).collect::<Res<_>>()?),
+        let render_cmd = |c: &CmdSpec| -> Res<Cmd> {
+            Ok(match c {
+                CmdSpec::Shell(t) => Cmd::Shell(t.render(&ctx)?),
+                CmdSpec::Argv(a) => {
+                    Cmd::Argv(a.iter().map(|t| t.render(&ctx)).collect::<Res<_>>()?)
+                }
+            })
         };
+        let cmd = render_cmd(&s.cmd)?;
+        let cond = s.cond.as_ref().map(render_cmd).transpose()?;
         let cwd = match &s.cwd {
             Some(t) => self.root.join(t.render(&ctx)?),
             None => self.root.clone(),
@@ -345,6 +362,7 @@ impl Config {
         Ok(Service {
             name: s.name.clone(),
             cmd,
+            cond,
             cwd,
             env,
             ready: s.ready.clone(),
@@ -536,6 +554,29 @@ env = { DB = "127.0.0.1:{{ports.db}}", N = 3 }
         assert_eq!(
             e("[[run]]\ncmd = \"x\"\nready = \"x\"\n[services.a]\ncmd = \"x\""),
             "unknown key `run[0].ready`"
+        );
+    }
+
+    #[test]
+    fn cond() {
+        let cfg = parse(
+            "[services.a]\ncmd = \"x\"\nif = [\"test\", \"{{ports.a}}\"]\n",
+            PathBuf::from("/r"),
+        )
+        .unwrap();
+        assert_eq!(cfg.port_names().into_iter().collect::<Vec<_>>(), ["a"]);
+        let ports = BTreeMap::from([("a".to_string(), 8000)]);
+        let svcs = cfg.render(&ports, Path::new("/r/.ads"), &[]).unwrap();
+        assert!(matches!(&svcs[0].cond, Some(Cmd::Argv(a)) if a == &["test", "8000"]));
+
+        let e = |s: &str| parse(s, PathBuf::from("/r")).err().unwrap();
+        assert_eq!(
+            e("[services.a]\ncmd = \"x\"\nif = []"),
+            "`services.a.if` must be a string or a non-empty array of strings"
+        );
+        assert_eq!(
+            e("[[run]]\ncmd = \"x\"\nif = \"x\"\n[services.a]\ncmd = \"x\""),
+            "unknown key `run[0].if`"
         );
     }
 }

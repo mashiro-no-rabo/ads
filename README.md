@@ -1,13 +1,13 @@
 # ads
 
-Run a development stack defined in `ads.toml`. Use `ads --help` for commands.
+Run a development stack defined in `ads.toml`.
 
-Running `ads` without a command starts services in the foreground, like `ads up`.
-It searches the current directory and its parents for `ads.toml`, or uses the
-config specified with `-c`. If no config is found, it shows usage.
+`ads` (or `ads up`) starts services in the foreground. It searches the current
+directory and its parents for `ads.toml`; use `ads -c path/to/ads.toml` to choose
+a config. With no command or config, it shows usage. See `ads --help` for commands.
 
-Use `ads port web` to print only the assigned port number for `web`, for example
-`8000`. The stack must be running. `ads ports` lists all assigned ports.
+While the stack is running, `ads port web` prints the assigned port number for
+`web`, and `ads ports` lists all assigned ports.
 
 ## Waiting for services
 
@@ -21,20 +21,35 @@ cmd = "run --db-port {{ports.db}}"
 wait = ["db"]
 ```
 
-`ready` is a regex matched against each stdout/stderr line. A service becomes
-ready on its first match and stays ready for the rest of the stack's life, so
-restarting it later does not block dependents. `wait` lists services that must
-be ready before this one starts. They must be defined above it in `ads.toml`
-and must have `ready` set. Services still waiting show as `waiting` in
-`ads ps`. Waits on services left out by `ads up svc...` are ignored.
+`ready` is a regex matched against each stdout/stderr line. The first match marks
+the service ready for the stack's lifetime, including across service restarts.
+
+`wait` delays startup until the listed services are ready. Each must be defined
+earlier in `ads.toml` and have a `ready` pattern. Waiting services show as
+`waiting` in `ads ps`. Dependencies excluded by `ads up svc...` are ignored.
+
+## Conditional services
+
+```toml
+[services.worker]
+cmd = "run-worker"
+if = "test -f .env.worker"
+```
+
+`if` runs before each service start, after any `wait`. Exit code 0 starts the
+service; otherwise, `ads ps` shows `skipped` with the exit reason. Use `ads start`
+to re-evaluate a skipped service. Skipped services satisfy dependents' `wait`.
+
+Like `cmd`, `if` accepts a shell string or an argv array, supports templates,
+and uses the service's `cwd` and `env`. Its output goes to the service log.
 
 ## Opening URLs and ports
 
-Define named destinations in an `[open]` section:
+Define named destinations in `[open]`:
 
 ```toml
 [services.web]
-cmd = "npm run dev -- --port {{ports.web}}"
+cmd = "pnpm run dev -- --port {{ports.web}}"
 
 [open]
 web = "http://localhost:{{ports.web}}/app"
@@ -42,20 +57,16 @@ admin = 3001
 docs = "https://example.com/docs"
 ```
 
-- `ads open web` opens the named destination.
-- `ads open` opens the first `[open]` entry in config-file order.
-- `ads open --all` opens every destination in config-file order.
+- `ads open web` opens a named destination.
+- `ads open` opens the first entry.
+- `ads open --all` opens every entry in config-file order.
 
-Integer ports open as `http://localhost:<port>` and must be between 1 and
-65535. A string containing just a port also works, including
-`web = "{{ports.web}}"`.
+Ports (1–65535) open as `http://localhost:<port>`. They can be integers or strings,
+including `web = "{{ports.web}}"`.
 
-URL strings support the same templates as service commands, including
-`{{ports.name}}` and `{{env.NAME}}`. Templated ports use the assignments
-of the running stack, so run `ads up` first. Fixed ports and static URLs
-can be opened without starting the stack. Port references in `[open]`
-participate in allocation when the stack starts.
+Strings support the same templates as service commands, including `{{env.NAME}}`.
+References to `{{ports.name}}` participate in port allocation and require a running
+stack. Fixed ports and static URLs work without starting the stack.
 
-Destinations are passed directly to the macOS `open` command, without a shell.
-The usual config discovery and `ads -c path/to/ads.toml open web` work here too.
-`ads check` validates and previews rendered destinations without opening them.
+Destinations go directly to the macOS `open` command without a shell. Use
+`ads check` to validate and preview them without opening anything.

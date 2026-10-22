@@ -764,3 +764,57 @@ fn waiting_service_stops_on_shutdown() {
     assert!(ads(&dir, &["down"]).status.success());
     assert!(wait_exit(&mut d, Duration::from_secs(2)));
 }
+
+#[test]
+fn if_condition() {
+    let dir = setup(
+        "if",
+        r#"
+[services.db]
+cmd = "echo up; sleep 1000"
+if = "test -f enable-db"
+ready = "^up$"
+
+[services.api]
+cmd = "sleep 1000"
+if = ["true"]
+wait = ["db"]
+"#,
+    );
+    let mut d = up(&dir);
+    // A skipped dependency counts as satisfied.
+    running_groups(&dir, 1);
+    assert_eq!(pid_of(&dir, "db").1, "skipped");
+    assert_eq!(status(&dir)[1].3, "if: code 1");
+
+    let out = ads(&dir, &["start", "db"]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "db skipped (if: code 1)\n"
+    );
+    fs::write(dir.join("enable-db"), "").unwrap();
+    let out = ads(&dir, &["start", "db"]);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("db running"),
+        "{out:?}"
+    );
+
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+}
+
+#[test]
+fn hanging_if_stops_on_shutdown() {
+    let dir = setup(
+        "if-hang",
+        "[services.a]\ncmd = 'sleep 1000'\nif = 'sleep 1000'\n",
+    );
+    let mut d = up(&dir);
+    assert!(wait_for(Duration::from_secs(3), || {
+        status(&dir).iter().any(|r| r.2 == "checking")
+    }));
+    let pid = status(&dir)[0].1;
+    assert!(ads(&dir, &["down"]).status.success());
+    assert!(wait_exit(&mut d, Duration::from_secs(2)));
+    assert!(!group_alive(pid));
+}
